@@ -1,19 +1,25 @@
 package com.facebook.presto.sql.planner;
 
+import com.facebook.presto.common.type.BooleanType;
+import com.facebook.presto.common.type.Type;
+import com.facebook.presto.hive.$internal.com.google.common.collect.ImmutableList;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
+import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
 import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.ConstantExpression;
 import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.sql.analyzer.FunctionAndTypeResolver;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.relational.FunctionResolution;
 
+import java.util.List;
 import java.util.Optional;
 
-import static com.facebook.presto.common.function.OperatorType.EQUALS;
+import static com.facebook.presto.common.function.OperatorType.EQUAL;
 import static com.facebook.presto.common.function.OperatorType.GREATER_THAN_OR_EQUAL;
 import static com.facebook.presto.common.function.OperatorType.LESS_THAN;
 import static com.facebook.presto.common.type.TimestampType.TIMESTAMP;
@@ -40,7 +46,7 @@ public class ConvertDateTimestampToTimestampBounds
     public ConvertDateTimestampToTimestampBounds(FunctionAndTypeManager functionAndTypeManager)
     {
         this.functionAndTypeManager = functionAndTypeManager;
-        this.functionResolution = new FunctionResolution(functionAndTypeManager.getFunctionAndTypeResolver());
+        this.functionResolution = new FunctionResolution((FunctionAndTypeResolver) functionAndTypeManager);
     }
 
     @Override
@@ -77,7 +83,7 @@ public class ConvertDateTimestampToTimestampBounds
         CallExpression call = (CallExpression) expression;
 
         // Check for equals operation
-        if (!call.getDisplayName().equals(EQUALS.getFunctionName()) ||
+        if (!call.getDisplayName().equals(EQUAL.getFunctionName()) ||
                 call.getArguments().size() != 2) {
             return expression;
         }
@@ -113,14 +119,19 @@ public class ConvertDateTimestampToTimestampBounds
         return expression;
     }
 
+    private static final Type BOOLEAN = BooleanType.BOOLEAN; // or however you reference it
+
     private RowExpression createAndExpression(RowExpression left, RowExpression right)
     {
+        FunctionHandle andHandle = functionResolution.lookupBuiltInFunction(
+                "and",
+                ImmutableList.of(BOOLEAN, BOOLEAN));
+
         return new CallExpression(
                 "and",
-                functionResolution.logicalAndFunction(),
-                left,
-                right
-        );
+                andHandle,
+                (Type) ImmutableList.of(left, right),
+                (List<RowExpression>) BOOLEAN);
     }
 
     private Optional<RowExpression> extractDateFunctionArgument(RowExpression first, RowExpression second)
