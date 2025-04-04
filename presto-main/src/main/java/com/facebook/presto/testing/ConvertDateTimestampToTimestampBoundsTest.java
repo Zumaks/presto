@@ -602,6 +602,32 @@ public class ConvertDateTimestampToTimestampBoundsTest
     }
 
     @Test
+    public void testRewriteSwappedPredicate()
+    {
+        // Test that the rule still applies when the date literal and date function are swapped:
+        // DATE '2020-01-01' = date(ts_col)
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression dateCall = new DummyCallExpression("date", "date", Collections.singletonList(tsCol));
+        RowExpression dateLiteral = new DummyConstantExpression("2020-01-01", "date");
+        // Swap the order: literal comes first
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(dateLiteral, dateCall));
+
+        FilterNode filterNode = new DummyFilterNode("filterSwapped", new DummyPlanNode("source"), equalsCall);
+
+        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped order");
+
+        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
+        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND");
+    }
+
+    @Test
     public void testNonMatchingPredicate()
     {
         // Create the rule
@@ -610,7 +636,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
         // Build a non‐call predicate (just a variable)
         RowExpression nonMatching = new DummyVariableExpression("some_bool_expr", "boolean");
-        FilterNode filterNode = new DummyFilterNode("filter2", new DummyPlanNode("source"), nonMatching);
+        FilterNode filterNode = new DummyFilterNode("filterNonMatching", new DummyPlanNode("source"), nonMatching);
 
         // Apply the rule
         Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
@@ -619,4 +645,28 @@ public class ConvertDateTimestampToTimestampBoundsTest
         Assertions.assertTrue(((MyResult) result).isEmpty(),
                 "Expected no rewrite for a non-matching predicate");
     }
+
+    @Test
+    public void testInvalidArgumentCountPredicate()
+    {
+        // Verify that if the equals operator has more than two arguments, no rewrite occurs.
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression dateCall = new DummyCallExpression("date", "date", Collections.singletonList(tsCol));
+        RowExpression dateLiteral = new DummyConstantExpression("2020-01-01", "date");
+
+        // Create an equals call with three arguments (which should be considered invalid)
+        RowExpression invalidEqualsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(dateCall, dateLiteral, tsCol));
+
+        FilterNode filterNode = new DummyFilterNode("filterInvalidArgs", new DummyPlanNode("source"), invalidEqualsCall);
+        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+
+        // Expect no rewrite due to invalid argument count
+        Assertions.assertTrue(((MyResult) result).isEmpty(),
+                "Expected no rewrite for an equals operator with invalid argument count");
+    }
 }
+
