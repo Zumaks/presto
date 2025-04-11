@@ -10,7 +10,7 @@ import java.util.Optional;
 
 /**
  * A self-contained JUnit 5 test for ConvertDateTimestampToTimestampBounds.
- * It defines minimal stubs of Presto interfaces so you can compile & run
+ * It defines minimal stubs of Presto interfaces so that it is possible to compile & run
  * without the full Presto codebase.
  */
 public class ConvertDateTimestampToTimestampBoundsTest
@@ -21,7 +21,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
     // -------------------------------------------------------------------
     //
 
-    // 1A) RowExpressionVisitor: let's define the subset we need
     interface RowExpressionVisitor<R, C>
     {
         R visitCall(DummyCallExpression call, C context);
@@ -94,7 +93,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
     /**
      * Simulates com.facebook.presto.metadata.FunctionAndTypeManager.
-     * Real code might have many methods, but we only define what's needed
+     * Real code might have many methods, but for now only defines what's needed
      * for the Rule constructor.
      */
     interface FunctionAndTypeManager
@@ -109,7 +108,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
     /**
      * A dummy implementation. The rule just needs an instance to call
-     * getFunctionAndTypeResolver(), so we do the simplest possible.
+     * getFunctionAndTypeResolver().
      */
     static class DummyFunctionAndTypeManager implements FunctionAndTypeManager
     {
@@ -276,8 +275,8 @@ public class ConvertDateTimestampToTimestampBoundsTest
     // 5A) Dummy CallExpression
     static class DummyCallExpression implements RowExpression
     {
-        private final String displayName; // e.g. "=", "date", "and"
-        private final DummyType type;     // e.g. "boolean", "date", "timestamp"
+        private final String displayName; // e.g. "=", "date", "and", "year"
+        private final DummyType type;     // e.g. "boolean", "date", "timestamp", "integer"
         private final List<RowExpression> arguments;
 
         DummyCallExpression(String displayName, String typeName, List<RowExpression> arguments)
@@ -426,9 +425,13 @@ public class ConvertDateTimestampToTimestampBoundsTest
     //
 
     /**
-     * Minimal version of your rule that checks for
+     * Minimal version of the rule that checks for
      *    date(ts_col) = DATE 'yyyy-mm-dd'
      * and rewrites to a pair of comparisons on timestamps.
+     *
+     * Extended to also support:
+     *    year(ts_col) = <numeric literal>
+     * which will be rewritten to timestamp comparisons for the given year.
      */
     static class ConvertDateTimestampToTimestampBounds implements Rule<FilterNode>
     {
@@ -480,31 +483,60 @@ public class ConvertDateTimestampToTimestampBoundsTest
             RowExpression left = call.getArguments().get(0);
             RowExpression right = call.getArguments().get(1);
 
-            // Attempt to find date(...) on one side and a date literal on the other
+            // Attempt to match a date(...) = DATE literal first...
             Optional<RowExpression> maybeCol = extractDateCall(left, right);
             Optional<DummyConstantExpression> maybeLiteral = extractDateLiteral(left, right);
 
             if (maybeCol.isPresent() && maybeLiteral.isPresent()) {
-                // dateValue might be something like "2020-01-01"
                 String dateValue = maybeLiteral.get().getValue().toString();
 
-                // Build lower bound: ts_col >= 'yyyy-mm-dd 00:00:00.000'
                 RowExpression lowerBound = new DummyCallExpression(
                         ">=", "boolean",
                         Arrays.asList(
                                 maybeCol.get(),
                                 new DummyConstantExpression(dateValue + " 00:00:00.000", "timestamp")));
 
-                // Build upper bound: ts_col < 'yyyy-mm-dd+1 00:00:00.000'
                 RowExpression upperBound = new DummyCallExpression(
                         "<", "boolean",
                         Arrays.asList(
                                 maybeCol.get(),
                                 new DummyConstantExpression(dateValue + "+1 00:00:00.000", "timestamp")));
 
-                // Combine with "and"
-                return new DummyCallExpression(
-                        "and", "boolean", Arrays.asList(lowerBound, upperBound));
+                return new DummyCallExpression("and", "boolean", Arrays.asList(lowerBound, upperBound));
+            }
+
+            // Otherwise, attempt to match a year(...) = <numeric literal>
+            Optional<RowExpression> maybeYearCol = extractYearCall(left, right);
+            Optional<DummyConstantExpression> maybeYearLiteral = extractYearLiteral(left, right);
+
+            if (maybeYearCol.isPresent() && maybeYearLiteral.isPresent()) {
+                Object literalVal = maybeYearLiteral.get().getValue();
+                long year;
+                if (literalVal instanceof Number) {
+                    year = ((Number) literalVal).longValue();
+                }
+                else {
+                    return expression;
+                }
+                // Build boundaries for the year:
+                // Lower bound: year-01-01 00:00:00.000
+                // Upper bound: (year+1)-01-01 00:00:00.000
+                String lowerTimestamp = String.format("%d-01-01 00:00:00.000", year);
+                String upperTimestamp = String.format("%d-01-01 00:00:00.000", year + 1);
+
+                RowExpression lowerBound = new DummyCallExpression(
+                        ">=", "boolean",
+                        Arrays.asList(
+                                maybeYearCol.get(),
+                                new DummyConstantExpression(lowerTimestamp, "timestamp")));
+
+                RowExpression upperBound = new DummyCallExpression(
+                        "<", "boolean",
+                        Arrays.asList(
+                                maybeYearCol.get(),
+                                new DummyConstantExpression(upperTimestamp, "timestamp")));
+
+                return new DummyCallExpression("and", "boolean", Arrays.asList(lowerBound, upperBound));
             }
 
             return expression;
@@ -512,11 +544,9 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
         private Optional<RowExpression> extractDateCall(RowExpression first, RowExpression second)
         {
-            // Check first
             if (isDateFunction(first)) {
                 return Optional.of(((DummyCallExpression) first).getArguments().get(0));
             }
-            // Check second
             if (isDateFunction(second)) {
                 return Optional.of(((DummyCallExpression) second).getArguments().get(0));
             }
@@ -548,6 +578,43 @@ public class ConvertDateTimestampToTimestampBoundsTest
         private boolean isDateType(DummyConstantExpression expr)
         {
             return "date".equalsIgnoreCase(expr.getType().getDisplayName());
+        }
+
+        private Optional<RowExpression> extractYearCall(RowExpression first, RowExpression second)
+        {
+            if (isYearFunction(first)) {
+                return Optional.of(((DummyCallExpression) first).getArguments().get(0));
+            }
+            if (isYearFunction(second)) {
+                return Optional.of(((DummyCallExpression) second).getArguments().get(0));
+            }
+            return Optional.empty();
+        }
+
+        private boolean isYearFunction(RowExpression expr)
+        {
+            if (!(expr instanceof DummyCallExpression)) {
+                return false;
+            }
+            DummyCallExpression call = (DummyCallExpression) expr;
+            return "year".equalsIgnoreCase(call.getDisplayName()) &&
+                    !call.getArguments().isEmpty();
+        }
+
+        private Optional<DummyConstantExpression> extractYearLiteral(RowExpression first, RowExpression second)
+        {
+            if ((first instanceof DummyConstantExpression) && isYearLiteral((DummyConstantExpression) first)) {
+                return Optional.of((DummyConstantExpression) first);
+            }
+            if ((second instanceof DummyConstantExpression) && isYearLiteral((DummyConstantExpression) second)) {
+                return Optional.of((DummyConstantExpression) second);
+            }
+            return Optional.empty();
+        }
+
+        private boolean isYearLiteral(DummyConstantExpression expr)
+        {
+            return "integer".equalsIgnoreCase(expr.getType().getDisplayName());
         }
     }
 
@@ -625,6 +692,96 @@ public class ConvertDateTimestampToTimestampBoundsTest
         DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
         Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
         Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND");
+    }
+
+    // -------------------------------
+    // New tests for the year() function
+    // -------------------------------
+
+    @Test
+    public void testRewriteYearComparison()
+    {
+        // Create the rule with a dummy manager; now testing year rewriting:
+        // year(ts_col) = 1984  -->  ts_col >= '1984-01-01 00:00:00.000'
+        //                        and ts_col <  '1985-01-01 00:00:00.000'
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        // Build a predicate: year(ts_col) = 1984
+        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression yearCall = new DummyCallExpression("year", "integer", Collections.singletonList(tsCol));
+        RowExpression yearLiteral = new DummyConstantExpression(1984, "integer");
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(yearCall, yearLiteral));
+
+        // Create a FilterNode with that predicate
+        FilterNode filterNode = new DummyFilterNode("filterYear", new DummyPlanNode("source"), equalsCall);
+
+        // Apply the rule
+        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+
+        // Check that it got a transformation
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for year predicate");
+
+        // Get the transformed node
+        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
+        RowExpression newPredicate = transformed.getPredicate();
+
+        // The new predicate should be an "and" expression combining two comparisons
+        Assertions.assertTrue(newPredicate instanceof DummyCallExpression, "New predicate should be a call expression");
+        DummyCallExpression andCall = (DummyCallExpression) newPredicate;
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for year predicate");
+
+        // Check the first part: >= comparison
+        RowExpression lowerBound = andCall.getArguments().get(0);
+        Assertions.assertTrue(lowerBound instanceof DummyCallExpression, "Lower bound should be a call expression");
+        DummyCallExpression lowerComparison = (DummyCallExpression) lowerBound;
+        Assertions.assertEquals(">=", lowerComparison.getDisplayName());
+
+        // The right-hand side of the lower comparison should be a constant with value "1984-01-01 00:00:00.000"
+        RowExpression lowerConstant = lowerComparison.getArguments().get(1);
+        Assertions.assertTrue(lowerConstant instanceof DummyConstantExpression);
+        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerConstant;
+        Assertions.assertEquals("1984-01-01 00:00:00.000", lowerConst.getValue().toString());
+
+        // Check the second part: < comparison
+        RowExpression upperBound = andCall.getArguments().get(1);
+        Assertions.assertTrue(upperBound instanceof DummyCallExpression, "Upper bound should be a call expression");
+        DummyCallExpression upperComparison = (DummyCallExpression) upperBound;
+        Assertions.assertEquals("<", upperComparison.getDisplayName());
+
+        // The right-hand side of the upper comparison should be a constant with value "1985-01-01 00:00:00.000"
+        RowExpression upperConstant = upperComparison.getArguments().get(1);
+        Assertions.assertTrue(upperConstant instanceof DummyConstantExpression);
+        DummyConstantExpression upperConst = (DummyConstantExpression) upperConstant;
+        Assertions.assertEquals("1985-01-01 00:00:00.000", upperConst.getValue().toString());
+    }
+
+    @Test
+    public void testRewriteSwappedYearPredicate()
+    {
+        // Test that the rule applies when the year literal and year() function are swapped:
+        // i.e., 1984 = year(ts_col)
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression yearCall = new DummyCallExpression("year", "integer", Collections.singletonList(tsCol));
+        RowExpression yearLiteral = new DummyConstantExpression(1984, "integer");
+        // Swap order: literal comes first
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(yearLiteral, yearCall));
+
+        FilterNode filterNode = new DummyFilterNode("filterSwappedYear", new DummyPlanNode("source"), equalsCall);
+
+        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped year predicate");
+
+        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
+        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped year predicate");
     }
 
     @Test
