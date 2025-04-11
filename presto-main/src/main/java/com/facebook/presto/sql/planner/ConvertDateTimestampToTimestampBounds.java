@@ -28,17 +28,13 @@ import static com.facebook.presto.sql.relational.Expressions.comparisonExpressio
 import static com.facebook.presto.sql.relational.Expressions.constant;
 
 /**
- * Rule to unwrap date functions in comparisons with literals
- * Transforms:
- *   date(ts_col) = DATE 'yyyy-mm-dd'
- * to:
- *   ts_col >= TIMESTAMP 'yyyy-mm-dd 00:00:00.000' AND
- *   ts_col < TIMESTAMP 'yyyy-mm-dd+1 00:00:00.000'
+ * Rule to unwrap date and year functions in comparisons with literals.
  */
 public class ConvertDateTimestampToTimestampBounds
         implements Rule<FilterNode>
 {
     private static final Pattern<FilterNode> PATTERN = filter();
+    private static final Type BOOLEAN = BooleanType.BOOLEAN; // or however you reference it
 
     private final FunctionAndTypeManager functionAndTypeManager;
     private final StandardFunctionResolution functionResolution;
@@ -75,51 +71,84 @@ public class ConvertDateTimestampToTimestampBounds
 
     private RowExpression rewritePredicate(RowExpression expression)
     {
-        // If not a function call, do nothing
+        // Only handling binary comparison expressions
         if (!(expression instanceof CallExpression)) {
             return expression;
         }
 
         CallExpression call = (CallExpression) expression;
 
-        // Check for equals operation
-        if (!call.getDisplayName().equals(EQUAL.getFunctionName()) ||
-                call.getArguments().size() != 2) {
+        // Proceed only for equality comparisons of two arguments
+        if (!call.getDisplayName().equals(EQUAL.getFunctionName()) || call.getArguments().size() != 2) {
             return expression;
         }
 
         RowExpression left = call.getArguments().get(0);
         RowExpression right = call.getArguments().get(1);
 
-        // Try to extract date function argument and date literal in both orders
-        Optional<RowExpression> maybeCol = extractDateFunctionArgument(left, right);
-        Optional<ConstantExpression> maybeDate = extractDateLiteral(left, right);
+        // First try to extract a date() function call and a date literal.
+        Optional<RowExpression> maybeDateCol = extractDateFunctionArgument(left, right);
+        Optional<ConstantExpression> maybeDateLiteral = extractDateLiteral(left, right);
 
-        if (maybeCol.isPresent() && maybeDate.isPresent()) {
-            // Create lower and upper bound timestamp expressions
+        if (maybeDateCol.isPresent() && maybeDateLiteral.isPresent()) {
+            // Lower and upper bounds for a date:
+            // e.g., DATE '1984-01-08' becomes TIMESTAMP '1984-01-08 00:00:00.000'
+            // and TIMESTAMP '1984-01-09 00:00:00.000'
+            String dateValue = maybeDateLiteral.get().getValue().toString();
             RowExpression lowerBound = comparisonExpression(
                     functionResolution,
                     GREATER_THAN_OR_EQUAL,
-                    maybeCol.get(),
-                    constant(maybeDate.get().getValue() + " 00:00:00.000", TIMESTAMP)
+                    maybeDateCol.get(),
+                    constant(dateValue + " 00:00:00.000", TIMESTAMP)
             );
 
             RowExpression upperBound = comparisonExpression(
                     functionResolution,
                     LESS_THAN,
-                    maybeCol.get(),
-                    constant(maybeDate.get().getValue() + "+1 00:00:00.000", TIMESTAMP)
+                    maybeDateCol.get(),
+                    constant(dateValue + "+1 00:00:00.000", TIMESTAMP)
             );
 
-            // Create AND expression combining lower and upper bounds
             return createAndExpression(lowerBound, upperBound);
         }
 
-        // If not recognized, leave it alone
+        // Otherwise, try to extract a year() function and a numeric literal.
+        Optional<RowExpression> maybeYearCol = extractYearFunctionArgument(left, right);
+        Optional<ConstantExpression> maybeYearLiteral = extractYearLiteral(left, right);
+
+        if (maybeYearCol.isPresent() && maybeYearLiteral.isPresent()) {
+            Object literalVal = maybeYearLiteral.get().getValue();
+            long year;
+            if (literalVal instanceof Number) {
+                year = ((Number) literalVal).longValue();
+            } else {
+                return expression;
+            }
+
+            // Build timestamp boundaries based on the year.
+            String lowerTimestamp = String.format("%d-01-01 00:00:00.000", year);
+            String upperTimestamp = String.format("%d-01-01 00:00:00.000", year + 1);
+
+            RowExpression lowerBound = comparisonExpression(
+                    functionResolution,
+                    GREATER_THAN_OR_EQUAL,
+                    maybeYearCol.get(),
+                    constant(lowerTimestamp, TIMESTAMP)
+            );
+
+            RowExpression upperBound = comparisonExpression(
+                    functionResolution,
+                    LESS_THAN,
+                    maybeYearCol.get(),
+                    constant(upperTimestamp, TIMESTAMP)
+            );
+
+            return createAndExpression(lowerBound, upperBound);
+        }
+
+        // If none matched, return the expression unchanged.
         return expression;
     }
-
-    private static final Type BOOLEAN = BooleanType.BOOLEAN; // or however you reference it
 
     private RowExpression createAndExpression(RowExpression left, RowExpression right)
     {
@@ -127,6 +156,7 @@ public class ConvertDateTimestampToTimestampBounds
                 "and",
                 ImmutableList.of(BOOLEAN, BOOLEAN));
 
+        // Create an 'and' call combining the two expressions.
         return new CallExpression(
                 "and",
                 andHandle,
@@ -134,27 +164,23 @@ public class ConvertDateTimestampToTimestampBounds
                 (List<RowExpression>) BOOLEAN);
     }
 
+    // --- Date Function Extraction (for date()) ---
+
     private Optional<RowExpression> extractDateFunctionArgument(RowExpression first, RowExpression second)
     {
-        // Check for date function on first argument
         Optional<RowExpression> firstCheck = extractDateFunction(first);
         if (firstCheck.isPresent()) {
             return firstCheck;
         }
-
-        // Check for date function on second argument
         return extractDateFunction(second);
     }
 
     private Optional<ConstantExpression> extractDateLiteral(RowExpression first, RowExpression second)
     {
-        // Try to extract date from first argument
-        Optional<ConstantExpression> firstDateCheck = extractConstantDateLiteral(first);
-        if (firstDateCheck.isPresent()) {
-            return firstDateCheck;
+        Optional<ConstantExpression> firstCheck = extractConstantDateLiteral(first);
+        if (firstCheck.isPresent()) {
+            return firstCheck;
         }
-
-        // Try to extract date from second argument
         return extractConstantDateLiteral(second);
     }
 
@@ -163,18 +189,13 @@ public class ConvertDateTimestampToTimestampBounds
         if (!(expr instanceof CallExpression)) {
             return Optional.empty();
         }
-
         CallExpression call = (CallExpression) expr;
-
-        // Check for date function (could be expanded for other date-related functions)
+        // Check for date() function by name and return the underlying timestamp column.
         boolean isDateFunction = call.getDisplayName().equalsIgnoreCase("date") &&
                 call.getType().toString().equalsIgnoreCase("date");
-
         if (!isDateFunction || call.getArguments().isEmpty()) {
             return Optional.empty();
         }
-
-        // Return the underlying timestamp expression
         return Optional.of(call.getArguments().get(0));
     }
 
@@ -183,10 +204,56 @@ public class ConvertDateTimestampToTimestampBounds
         if (!(expr instanceof ConstantExpression)) {
             return Optional.empty();
         }
-
         ConstantExpression c = (ConstantExpression) expr;
-
-        // Directly return the ConstantExpression without parsing
+        // We assume the constant's value is a string literal representing a date.
         return Optional.of(c);
+    }
+
+    // --- Year Function Extraction (for year()) ---
+
+    private Optional<RowExpression> extractYearFunctionArgument(RowExpression first, RowExpression second)
+    {
+        Optional<RowExpression> firstCheck = extractYearFunction(first);
+        if (firstCheck.isPresent()) {
+            return firstCheck;
+        }
+        return extractYearFunction(second);
+    }
+
+    private Optional<ConstantExpression> extractYearLiteral(RowExpression first, RowExpression second)
+    {
+        Optional<ConstantExpression> firstCheck = extractConstantYearLiteral(first);
+        if (firstCheck.isPresent()) {
+            return firstCheck;
+        }
+        return extractConstantYearLiteral(second);
+    }
+
+    private Optional<RowExpression> extractYearFunction(RowExpression expr)
+    {
+        if (!(expr instanceof CallExpression)) {
+            return Optional.empty();
+        }
+        CallExpression call = (CallExpression) expr;
+        // Check for year() function based on display name.
+        if (!call.getDisplayName().equalsIgnoreCase("year") || call.getArguments().isEmpty()) {
+            return Optional.empty();
+        }
+        // Return the underlying timestamp expression.
+        return Optional.of(call.getArguments().get(0));
+    }
+
+    private Optional<ConstantExpression> extractConstantYearLiteral(RowExpression expr)
+    {
+        if (!(expr instanceof ConstantExpression)) {
+            return Optional.empty();
+        }
+        ConstantExpression c = (ConstantExpression) expr;
+        Object value = c.getValue();
+        // Check if the constant is a number representing the year.
+        if (value instanceof Number) {
+            return Optional.of(c);
+        }
+        return Optional.empty();
     }
 }
