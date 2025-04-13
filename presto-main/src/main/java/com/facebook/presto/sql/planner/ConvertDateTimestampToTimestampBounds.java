@@ -27,9 +27,6 @@ import static com.facebook.presto.sql.planner.plan.Patterns.filter;
 import static com.facebook.presto.sql.relational.Expressions.comparisonExpression;
 import static com.facebook.presto.sql.relational.Expressions.constant;
 
-/**
- * Rule to unwrap date and year functions in comparisons with literals.
- */
 public class ConvertDateTimestampToTimestampBounds
         implements Rule<FilterNode>
 {
@@ -86,14 +83,12 @@ public class ConvertDateTimestampToTimestampBounds
         RowExpression left = call.getArguments().get(0);
         RowExpression right = call.getArguments().get(1);
 
-        // First try to extract a date() function call and a date literal.
+        // --- Existing logic for date() and year() functions ---
+
         Optional<RowExpression> maybeDateCol = extractDateFunctionArgument(left, right);
         Optional<ConstantExpression> maybeDateLiteral = extractDateLiteral(left, right);
 
         if (maybeDateCol.isPresent() && maybeDateLiteral.isPresent()) {
-            // Lower and upper bounds for a date:
-            // e.g., DATE '1984-01-08' becomes TIMESTAMP '1984-01-08 00:00:00.000'
-            // and TIMESTAMP '1984-01-09 00:00:00.000'
             String dateValue = maybeDateLiteral.get().getValue().toString();
             RowExpression lowerBound = comparisonExpression(
                     functionResolution,
@@ -112,7 +107,6 @@ public class ConvertDateTimestampToTimestampBounds
             return createAndExpression(lowerBound, upperBound);
         }
 
-        // Otherwise, try to extract a year() function and a numeric literal.
         Optional<RowExpression> maybeYearCol = extractYearFunctionArgument(left, right);
         Optional<ConstantExpression> maybeYearLiteral = extractYearLiteral(left, right);
 
@@ -125,7 +119,6 @@ public class ConvertDateTimestampToTimestampBounds
                 return expression;
             }
 
-            // Build timestamp boundaries based on the year.
             String lowerTimestamp = String.format("%d-01-01 00:00:00.000", year);
             String upperTimestamp = String.format("%d-01-01 00:00:00.000", year + 1);
 
@@ -140,6 +133,56 @@ public class ConvertDateTimestampToTimestampBounds
                     functionResolution,
                     LESS_THAN,
                     maybeYearCol.get(),
+                    constant(upperTimestamp, TIMESTAMP)
+            );
+
+            return createAndExpression(lowerBound, upperBound);
+        }
+
+        // --- New logic for month() function ---
+        Optional<RowExpression> maybeMonthCol = extractMonthFunctionArgument(left, right);
+        Optional<ConstantExpression> maybeMonthLiteral = extractMonthLiteral(left, right);
+
+        if (maybeMonthCol.isPresent() && maybeMonthLiteral.isPresent()) {
+            // Assume literal is a string in "YYYY-MM" format.
+            String monthValue = maybeMonthLiteral.get().getValue().toString();
+            String[] parts = monthValue.split("-");
+            if (parts.length != 2) {
+                return expression;
+            }
+            int yearPart, monthPart;
+            try {
+                yearPart = Integer.parseInt(parts[0]);
+                monthPart = Integer.parseInt(parts[1]);
+            }
+            catch (NumberFormatException e) {
+                return expression;
+            }
+            if (monthPart < 1 || monthPart > 12) {
+                return expression;
+            }
+            // Lower bound: first day of the month.
+            String lowerTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart);
+            // Upper bound: first day of the next month. Handle December specially.
+            String upperTimestamp;
+            if (monthPart == 12) {
+                upperTimestamp = String.format("%d-01-01 00:00:00.000", yearPart + 1);
+            }
+            else {
+                upperTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart + 1);
+            }
+
+            RowExpression lowerBound = comparisonExpression(
+                    functionResolution,
+                    GREATER_THAN_OR_EQUAL,
+                    maybeMonthCol.get(),
+                    constant(lowerTimestamp, TIMESTAMP)
+            );
+
+            RowExpression upperBound = comparisonExpression(
+                    functionResolution,
+                    LESS_THAN,
+                    maybeMonthCol.get(),
                     constant(upperTimestamp, TIMESTAMP)
             );
 
@@ -190,7 +233,6 @@ public class ConvertDateTimestampToTimestampBounds
             return Optional.empty();
         }
         CallExpression call = (CallExpression) expr;
-        // Check for date() function by name and return the underlying timestamp column.
         boolean isDateFunction = call.getDisplayName().equalsIgnoreCase("date") &&
                 call.getType().toString().equalsIgnoreCase("date");
         if (!isDateFunction || call.getArguments().isEmpty()) {
@@ -205,12 +247,10 @@ public class ConvertDateTimestampToTimestampBounds
             return Optional.empty();
         }
         ConstantExpression c = (ConstantExpression) expr;
-        // We assume the constant's value is a string literal representing a date.
         return Optional.of(c);
     }
 
     // --- Year Function Extraction (for year()) ---
-
     private Optional<RowExpression> extractYearFunctionArgument(RowExpression first, RowExpression second)
     {
         Optional<RowExpression> firstCheck = extractYearFunction(first);
@@ -235,11 +275,9 @@ public class ConvertDateTimestampToTimestampBounds
             return Optional.empty();
         }
         CallExpression call = (CallExpression) expr;
-        // Check for year() function based on display name.
         if (!call.getDisplayName().equalsIgnoreCase("year") || call.getArguments().isEmpty()) {
             return Optional.empty();
         }
-        // Return the underlying timestamp expression.
         return Optional.of(call.getArguments().get(0));
     }
 
@@ -250,10 +288,52 @@ public class ConvertDateTimestampToTimestampBounds
         }
         ConstantExpression c = (ConstantExpression) expr;
         Object value = c.getValue();
-        // Check if the constant is a number representing the year.
         if (value instanceof Number) {
             return Optional.of(c);
         }
         return Optional.empty();
     }
+
+    // --- Month Function Extraction (for month()) ---
+
+    private Optional<RowExpression> extractMonthFunctionArgument(RowExpression first, RowExpression second)
+    {
+        Optional<RowExpression> firstCheck = extractMonthFunction(first);
+        if (firstCheck.isPresent()) {
+            return firstCheck;
+        }
+        return extractMonthFunction(second);
+    }
+
+    private Optional<ConstantExpression> extractMonthLiteral(RowExpression first, RowExpression second)
+    {
+        Optional<ConstantExpression> firstCheck = extractConstantMonthLiteral(first);
+        if (firstCheck.isPresent()) {
+            return firstCheck;
+        }
+        return extractConstantMonthLiteral(second);
+    }
+
+    private Optional<RowExpression> extractMonthFunction(RowExpression expr)
+    {
+        if (!(expr instanceof CallExpression)) {
+            return Optional.empty();
+        }
+        CallExpression call = (CallExpression) expr;
+        if (!call.getDisplayName().equalsIgnoreCase("month") || call.getArguments().isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(call.getArguments().get(0));
+    }
+
+    private Optional<ConstantExpression> extractConstantMonthLiteral(RowExpression expr)
+    {
+        if (!(expr instanceof ConstantExpression)) {
+            return Optional.empty();
+        }
+        ConstantExpression c = (ConstantExpression) expr;
+        // Assume the constant’s value is a string literal in the format "YYYY-MM".
+        return Optional.of(c);
+    }
 }
+
