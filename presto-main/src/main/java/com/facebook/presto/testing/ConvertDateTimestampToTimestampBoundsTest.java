@@ -275,7 +275,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
     // 5A) Dummy CallExpression
     static class DummyCallExpression implements RowExpression
     {
-        private final String displayName; // e.g. "=", "date", "and", "year"
+        private final String displayName; // e.g. "=", "date", "and", "year", "month"
         private final DummyType type;     // e.g. "boolean", "date", "timestamp", "integer"
         private final List<RowExpression> arguments;
 
@@ -431,7 +431,9 @@ public class ConvertDateTimestampToTimestampBoundsTest
      *
      * Extended to also support:
      *    year(ts_col) = <numeric literal>
-     * which will be rewritten to timestamp comparisons for the given year.
+     * and
+     *    month(ts_col) = 'YYYY-MM'
+     * which will be rewritten to timestamp comparisons for the given time period.
      */
     static class ConvertDateTimestampToTimestampBounds implements Rule<FilterNode>
     {
@@ -457,56 +459,54 @@ public class ConvertDateTimestampToTimestampBoundsTest
             RowExpression originalPredicate = filter.getPredicate();
             RowExpression rewritten = rewritePredicate(originalPredicate);
 
-            // If no rewrite occurred, return empty
             if (rewritten.equals(originalPredicate)) {
                 return MyResult.empty();
             }
 
-            // Otherwise return a new FilterNode with the rewritten predicate
             FilterNode newFilter = new DummyFilterNode(filter.getId(), filter.getSources().get(0), rewritten);
             return MyResult.ofPlanNode(newFilter);
         }
 
         private RowExpression rewritePredicate(RowExpression expression)
         {
-            // Must be a call expression
+            // Only handling binary comparison expressions
             if (!(expression instanceof DummyCallExpression)) {
                 return expression;
             }
+
             DummyCallExpression call = (DummyCallExpression) expression;
 
-            // Must be an "=" call with exactly two arguments
-            if (!"=".equals(call.getDisplayName()) || call.getArguments().size() != 2) {
+            // Proceed only for equality comparisons of two arguments
+            if (!call.getDisplayName().equals(EQUAL.getFunctionName()) || call.getArguments().size() != 2) {
                 return expression;
             }
 
             RowExpression left = call.getArguments().get(0);
             RowExpression right = call.getArguments().get(1);
 
-            // Attempt to match a date(...) = DATE literal first...
-            Optional<RowExpression> maybeCol = extractDateCall(left, right);
-            Optional<DummyConstantExpression> maybeLiteral = extractDateLiteral(left, right);
+            // --- Existing logic for date() and year() functions ---
 
-            if (maybeCol.isPresent() && maybeLiteral.isPresent()) {
-                String dateValue = maybeLiteral.get().getValue().toString();
+            Optional<RowExpression> maybeDateCol = extractDateFunctionArgument(left, right);
+            Optional<DummyConstantExpression> maybeDateLiteral = extractDateLiteral(left, right);
 
+            if (maybeDateCol.isPresent() && maybeDateLiteral.isPresent()) {
+                String dateValue = maybeDateLiteral.get().getValue().toString();
                 RowExpression lowerBound = new DummyCallExpression(
                         ">=", "boolean",
                         Arrays.asList(
-                                maybeCol.get(),
+                                maybeDateCol.get(),
                                 new DummyConstantExpression(dateValue + " 00:00:00.000", "timestamp")));
 
                 RowExpression upperBound = new DummyCallExpression(
                         "<", "boolean",
                         Arrays.asList(
-                                maybeCol.get(),
+                                maybeDateCol.get(),
                                 new DummyConstantExpression(dateValue + "+1 00:00:00.000", "timestamp")));
 
                 return new DummyCallExpression("and", "boolean", Arrays.asList(lowerBound, upperBound));
             }
 
-            // Otherwise, attempt to match a year(...) = <numeric literal>
-            Optional<RowExpression> maybeYearCol = extractYearCall(left, right);
+            Optional<RowExpression> maybeYearCol = extractYearFunctionArgument(left, right);
             Optional<DummyConstantExpression> maybeYearLiteral = extractYearLiteral(left, right);
 
             if (maybeYearCol.isPresent() && maybeYearLiteral.isPresent()) {
@@ -514,13 +514,10 @@ public class ConvertDateTimestampToTimestampBoundsTest
                 long year;
                 if (literalVal instanceof Number) {
                     year = ((Number) literalVal).longValue();
-                }
-                else {
+                } else {
                     return expression;
                 }
-                // Build boundaries for the year:
-                // Lower bound: year-01-01 00:00:00.000
-                // Upper bound: (year+1)-01-01 00:00:00.000
+
                 String lowerTimestamp = String.format("%d-01-01 00:00:00.000", year);
                 String upperTimestamp = String.format("%d-01-01 00:00:00.000", year + 1);
 
@@ -539,82 +536,189 @@ public class ConvertDateTimestampToTimestampBoundsTest
                 return new DummyCallExpression("and", "boolean", Arrays.asList(lowerBound, upperBound));
             }
 
+            // --- New logic for month() function ---
+            Optional<RowExpression> maybeMonthCol = extractMonthFunctionArgument(left, right);
+            Optional<DummyConstantExpression> maybeMonthLiteral = extractMonthLiteral(left, right);
+
+            if (maybeMonthCol.isPresent() && maybeMonthLiteral.isPresent()) {
+                // Assume literal is a string in "YYYY-MM" format.
+                String monthValue = maybeMonthLiteral.get().getValue().toString();
+                String[] parts = monthValue.split("-");
+                if (parts.length != 2) {
+                    return expression;
+                }
+                int yearPart, monthPart;
+                try {
+                    yearPart = Integer.parseInt(parts[0]);
+                    monthPart = Integer.parseInt(parts[1]);
+                }
+                catch (NumberFormatException e) {
+                    return expression;
+                }
+                if (monthPart < 1 || monthPart > 12) {
+                    return expression;
+                }
+                // Lower bound: first day of the month.
+                String lowerTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart);
+                // Upper bound: first day of the next month. Handle December specially.
+                String upperTimestamp;
+                if (monthPart == 12) {
+                    upperTimestamp = String.format("%d-01-01 00:00:00.000", yearPart + 1);
+                }
+                else {
+                    upperTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart + 1);
+                }
+
+                RowExpression lowerBound = new DummyCallExpression(
+                        ">=", "boolean",
+                        Arrays.asList(
+                                maybeMonthCol.get(),
+                                new DummyConstantExpression(lowerTimestamp, "timestamp")));
+
+                RowExpression upperBound = new DummyCallExpression(
+                        "<", "boolean",
+                        Arrays.asList(
+                                maybeMonthCol.get(),
+                                new DummyConstantExpression(upperTimestamp, "timestamp")));
+
+                return new DummyCallExpression("and", "boolean", Arrays.asList(lowerBound, upperBound));
+            }
+
+            // If none matched, return the expression unchanged.
             return expression;
         }
 
-        private Optional<RowExpression> extractDateCall(RowExpression first, RowExpression second)
+        private DummyCallExpression createAndExpression(RowExpression left, RowExpression right)
         {
-            if (isDateFunction(first)) {
-                return Optional.of(((DummyCallExpression) first).getArguments().get(0));
-            }
-            if (isDateFunction(second)) {
-                return Optional.of(((DummyCallExpression) second).getArguments().get(0));
-            }
-            return Optional.empty();
+            // For simplicity in this dummy implementation, we reuse the constructor.
+            return new DummyCallExpression("and", "boolean", Arrays.asList(left, right));
         }
 
-        private boolean isDateFunction(RowExpression expr)
+        // --- Date Function Extraction (for date()) ---
+
+        private Optional<RowExpression> extractDateFunctionArgument(RowExpression first, RowExpression second)
         {
-            if (!(expr instanceof DummyCallExpression)) {
-                return false;
+            Optional<RowExpression> firstCheck = extractDateFunction(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
             }
-            DummyCallExpression call = (DummyCallExpression) expr;
-            return "date".equalsIgnoreCase(call.getDisplayName()) &&
-                    "date".equalsIgnoreCase(call.getType().getDisplayName()) &&
-                    !call.getArguments().isEmpty();
+            return extractDateFunction(second);
         }
 
         private Optional<DummyConstantExpression> extractDateLiteral(RowExpression first, RowExpression second)
         {
-            if ((first instanceof DummyConstantExpression) && isDateType((DummyConstantExpression) first)) {
-                return Optional.of((DummyConstantExpression) first);
+            Optional<DummyConstantExpression> firstCheck = extractConstantDateLiteral(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
             }
-            if ((second instanceof DummyConstantExpression) && isDateType((DummyConstantExpression) second)) {
-                return Optional.of((DummyConstantExpression) second);
-            }
-            return Optional.empty();
+            return extractConstantDateLiteral(second);
         }
 
-        private boolean isDateType(DummyConstantExpression expr)
-        {
-            return "date".equalsIgnoreCase(expr.getType().getDisplayName());
-        }
-
-        private Optional<RowExpression> extractYearCall(RowExpression first, RowExpression second)
-        {
-            if (isYearFunction(first)) {
-                return Optional.of(((DummyCallExpression) first).getArguments().get(0));
-            }
-            if (isYearFunction(second)) {
-                return Optional.of(((DummyCallExpression) second).getArguments().get(0));
-            }
-            return Optional.empty();
-        }
-
-        private boolean isYearFunction(RowExpression expr)
+        private Optional<RowExpression> extractDateFunction(RowExpression expr)
         {
             if (!(expr instanceof DummyCallExpression)) {
-                return false;
+                return Optional.empty();
             }
             DummyCallExpression call = (DummyCallExpression) expr;
-            return "year".equalsIgnoreCase(call.getDisplayName()) &&
-                    !call.getArguments().isEmpty();
+            boolean isDateFunction = call.getDisplayName().equalsIgnoreCase("date") &&
+                    call.getType().toString().equalsIgnoreCase("date");
+            if (!isDateFunction || call.getArguments().isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(call.getArguments().get(0));
+        }
+
+        private Optional<DummyConstantExpression> extractConstantDateLiteral(RowExpression expr)
+        {
+            if (!(expr instanceof DummyConstantExpression)) {
+                return Optional.empty();
+            }
+            return Optional.of((DummyConstantExpression) expr);
+        }
+
+        // --- Year Function Extraction (for year()) ---
+        private Optional<RowExpression> extractYearFunctionArgument(RowExpression first, RowExpression second)
+        {
+            Optional<RowExpression> firstCheck = extractYearFunction(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
+            }
+            return extractYearFunction(second);
         }
 
         private Optional<DummyConstantExpression> extractYearLiteral(RowExpression first, RowExpression second)
         {
-            if ((first instanceof DummyConstantExpression) && isYearLiteral((DummyConstantExpression) first)) {
-                return Optional.of((DummyConstantExpression) first);
+            Optional<DummyConstantExpression> firstCheck = extractConstantYearLiteral(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
             }
-            if ((second instanceof DummyConstantExpression) && isYearLiteral((DummyConstantExpression) second)) {
-                return Optional.of((DummyConstantExpression) second);
+            return extractConstantYearLiteral(second);
+        }
+
+        private Optional<RowExpression> extractYearFunction(RowExpression expr)
+        {
+            if (!(expr instanceof DummyCallExpression)) {
+                return Optional.empty();
+            }
+            DummyCallExpression call = (DummyCallExpression) expr;
+            if (!call.getDisplayName().equalsIgnoreCase("year") || call.getArguments().isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(call.getArguments().get(0));
+        }
+
+        private Optional<DummyConstantExpression> extractConstantYearLiteral(RowExpression expr)
+        {
+            if (!(expr instanceof DummyConstantExpression)) {
+                return Optional.empty();
+            }
+            DummyConstantExpression c = (DummyConstantExpression) expr;
+            Object value = c.getValue();
+            if (value instanceof Number) {
+                return Optional.of(c);
             }
             return Optional.empty();
         }
 
-        private boolean isYearLiteral(DummyConstantExpression expr)
+        // --- Month Function Extraction (for month()) ---
+        private Optional<RowExpression> extractMonthFunctionArgument(RowExpression first, RowExpression second)
         {
-            return "integer".equalsIgnoreCase(expr.getType().getDisplayName());
+            Optional<RowExpression> firstCheck = extractMonthFunction(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
+            }
+            return extractMonthFunction(second);
+        }
+
+        private Optional<DummyConstantExpression> extractMonthLiteral(RowExpression first, RowExpression second)
+        {
+            Optional<DummyConstantExpression> firstCheck = extractConstantMonthLiteral(first);
+            if (firstCheck.isPresent()) {
+                return firstCheck;
+            }
+            return extractConstantMonthLiteral(second);
+        }
+
+        private Optional<RowExpression> extractMonthFunction(RowExpression expr)
+        {
+            if (!(expr instanceof DummyCallExpression)) {
+                return Optional.empty();
+            }
+            DummyCallExpression call = (DummyCallExpression) expr;
+            if (!call.getDisplayName().equalsIgnoreCase("month") || call.getArguments().isEmpty()) {
+                return Optional.empty();
+            }
+            return Optional.of(call.getArguments().get(0));
+        }
+
+        private Optional<DummyConstantExpression> extractConstantMonthLiteral(RowExpression expr)
+        {
+            if (!(expr instanceof DummyConstantExpression)) {
+                return Optional.empty();
+            }
+            DummyConstantExpression c = (DummyConstantExpression) expr;
+            // Assume the constant’s value is a string literal in the format "YYYY-MM".
+            return Optional.of(c);
         }
     }
 
@@ -784,46 +888,117 @@ public class ConvertDateTimestampToTimestampBoundsTest
         Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped year predicate");
     }
 
+    // -------------------------------
+    //  tests for the month() function
+    // -------------------------------
+
     @Test
-    public void testNonMatchingPredicate()
+    public void testRewriteMonthComparison()
     {
-        // Create the rule
+        // Create the rule with a dummy manager; now testing month rewriting:
+        // month(ts_col) = '2020-05'  -->  ts_col >= '2020-05-01 00:00:00.000'
+        //                              and ts_col <  '2020-06-01 00:00:00.000'
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        // Build a non‐call predicate (just a variable)
-        RowExpression nonMatching = new DummyVariableExpression("some_bool_expr", "boolean");
-        FilterNode filterNode = new DummyFilterNode("filterNonMatching", new DummyPlanNode("source"), nonMatching);
+        // Build a predicate: month(ts_col) = '2020-05'
+        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression monthCall = new DummyCallExpression("month", "timestamp", Collections.singletonList(tsCol));
+        // Use "varchar" or similar for the literal type if needed.
+        RowExpression monthLiteral = new DummyConstantExpression("2020-05", "varchar");
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(monthCall, monthLiteral));
+
+        // Create a FilterNode with that predicate
+        FilterNode filterNode = new DummyFilterNode("filterMonth", new DummyPlanNode("source"), equalsCall);
 
         // Apply the rule
         Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
 
-        // The rule should not rewrite a non‐matching predicate
-        Assertions.assertTrue(((MyResult) result).isEmpty(),
-                "Expected no rewrite for a non-matching predicate");
+        // Check that it got a transformation
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for month predicate");
+
+        // Get the transformed node
+        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
+        RowExpression newPredicate = transformed.getPredicate();
+
+        // The new predicate should be an "and" expression combining two comparisons
+        Assertions.assertTrue(newPredicate instanceof DummyCallExpression);
+        DummyCallExpression andCall = (DummyCallExpression) newPredicate;
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for month predicate");
+
+        // Check the first part: >= comparison with lower bound "2020-05-01 00:00:00.000"
+        RowExpression lowerBound = andCall.getArguments().get(0);
+        Assertions.assertTrue(lowerBound instanceof DummyCallExpression);
+        DummyCallExpression lowerComparison = (DummyCallExpression) lowerBound;
+        Assertions.assertEquals(">=", lowerComparison.getDisplayName());
+        RowExpression lowerConstant = lowerComparison.getArguments().get(1);
+        Assertions.assertTrue(lowerConstant instanceof DummyConstantExpression);
+        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerConstant;
+        Assertions.assertEquals("2020-05-01 00:00:00.000", lowerConst.getValue().toString());
+
+        // Check the second part: < comparison with upper bound "2020-06-01 00:00:00.000"
+        RowExpression upperBound = andCall.getArguments().get(1);
+        Assertions.assertTrue(upperBound instanceof DummyCallExpression);
+        DummyCallExpression upperComparison = (DummyCallExpression) upperBound;
+        Assertions.assertEquals("<", upperComparison.getDisplayName());
+        RowExpression upperConstant = upperComparison.getArguments().get(1);
+        Assertions.assertTrue(upperConstant instanceof DummyConstantExpression);
+        DummyConstantExpression upperConst = (DummyConstantExpression) upperConstant;
+        Assertions.assertEquals("2020-06-01 00:00:00.000", upperConst.getValue().toString());
     }
 
     @Test
-    public void testInvalidArgumentCountPredicate()
+    public void testRewriteSwappedMonthPredicate()
     {
-        // Verify that if the equals operator has more than two arguments, no rewrite occurs.
+        // Test that the rule applies when the month literal and month() function are swapped:
+        // i.e., '2020-05' = month(ts_col)
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
         RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression dateCall = new DummyCallExpression("date", "date", Collections.singletonList(tsCol));
-        RowExpression dateLiteral = new DummyConstantExpression("2020-01-01", "date");
+        RowExpression monthCall = new DummyCallExpression("month", "timestamp", Collections.singletonList(tsCol));
+        RowExpression monthLiteral = new DummyConstantExpression("2020-05", "varchar");
+        // Swap the order: literal comes first
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(monthLiteral, monthCall));
 
-        // Create an equals call with three arguments (which should be considered invalid)
-        RowExpression invalidEqualsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(dateCall, dateLiteral, tsCol));
+        FilterNode filterNode = new DummyFilterNode("filterSwappedMonth", new DummyPlanNode("source"), equalsCall);
 
-        FilterNode filterNode = new DummyFilterNode("filterInvalidArgs", new DummyPlanNode("source"), invalidEqualsCall);
         Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped month predicate");
 
-        // Expect no rewrite due to invalid argument count
-        Assertions.assertTrue(((MyResult) result).isEmpty(),
-                "Expected no rewrite for an equals operator with invalid argument count");
+        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
+        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped month predicate");
+    }
+
+    // -------------------------------
+    // Constants for comparison operators
+    // -------------------------------
+    private static final Operator EQUAL = Operator.EQUAL;
+    private static final Operator GREATER_THAN_OR_EQUAL = Operator.GREATER_THAN_OR_EQUAL;
+    private static final Operator LESS_THAN = Operator.LESS_THAN;
+
+    // Minimal enum to simulate operator types for testing.
+    enum Operator {
+        EQUAL("="),
+        GREATER_THAN_OR_EQUAL(">="),
+        LESS_THAN("<");
+
+        private final String functionName;
+
+        Operator(String functionName)
+        {
+            this.functionName = functionName;
+        }
+
+        public String getFunctionName()
+        {
+            return functionName;
+        }
     }
 }
 
