@@ -1000,5 +1000,72 @@ public class ConvertDateTimestampToTimestampBoundsTest
             return functionName;
         }
     }
+
+
+
+    // -------------------------------
+    // New tests for the hour() function
+    // -------------------------------
+
+    @Test
+    public void testRewriteHourComparison()
+    {
+        // hour(ts_col) = '2020-05-12-07'
+        //   --> ts_col >= '2020-05-12 07:00:00.000'
+        //   AND ts_col <  '2020-05-12 08:00:00.000'
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol= new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression hourCall= new DummyCallExpression("hour", "integer", Collections.singletonList(tsCol));
+        RowExpression hourLiteral= new DummyConstantExpression("2020-05-12-07", "varchar");
+        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
+                Arrays.asList(hourCall, hourLiteral));
+
+        FilterNode filterNode = new DummyFilterNode("filterHour", new DummyPlanNode("source"), equalsCall);
+        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for hour predicate");
+
+        DummyFilterNode transformed = (DummyFilterNode) ((MyResult) result).getPlanNode();
+        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for hour predicate");
+
+        // --- Lower bound check: ts_col >= '2020-05-12 07:00:00.000'
+        DummyCallExpression lowerComp = (DummyCallExpression) andCall.getArguments().get(0);
+        Assertions.assertEquals(">=", lowerComp.getDisplayName());
+        // verify the constant
+        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerComp.getArguments().get(1);
+        Assertions.assertEquals("2020-05-12 07:00:00.000", lowerConst.getValue().toString());
+
+        // --- Upper bound check: ts_col < '2020-05-12 08:00:00.000'
+        DummyCallExpression upperComp = (DummyCallExpression) andCall.getArguments().get(1);
+        Assertions.assertEquals("<", upperComp.getDisplayName());
+        DummyConstantExpression upperConst = (DummyConstantExpression) upperComp.getArguments().get(1);
+        Assertions.assertEquals("2020-05-12 08:00:00.000", upperConst.getValue().toString());
+    }
+
+    @Test
+    public void testRewriteSwappedHourPredicate()
+    {
+        // '2020-05-12-07' = hour(ts_col)
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol= new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression hourCall= new DummyCallExpression("hour", "integer", Collections.singletonList(tsCol));
+        RowExpression hourLiteral= new DummyConstantExpression("2020-05-12-07", "varchar");
+        RowExpression equalsCall= new DummyCallExpression("=", "boolean",
+                Arrays.asList(hourLiteral, hourCall));
+
+        FilterNode filterNode = new DummyFilterNode("filterSwappedHour", new DummyPlanNode("source"), equalsCall);
+        Rule.Result result= rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped hour predicate");
+
+        DummyCallExpression andCall = (DummyCallExpression) ((DummyFilterNode) ((MyResult) result).getPlanNode())
+                .getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped hour predicate");
+    }
 }
 
