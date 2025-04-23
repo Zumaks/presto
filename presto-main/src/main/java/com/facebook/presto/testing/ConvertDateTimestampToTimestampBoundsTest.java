@@ -19,11 +19,6 @@ import java.util.Optional;
  */
 public class ConvertDateTimestampToTimestampBoundsTest
 {
-    //
-    // -------------------------------------------------------------------
-    //  1) Minimal Presto-like interfaces/types
-    // -------------------------------------------------------------------
-    //
 
     interface RowExpressionVisitor<R, C>
     {
@@ -32,22 +27,18 @@ public class ConvertDateTimestampToTimestampBoundsTest
         R visitVariableReference(DummyVariableExpression variable, C context);
     }
 
-    // 1B) RowExpression with a getType() method returning our minimal Type
     interface RowExpression
     {
         <R, C> R accept(RowExpressionVisitor<R, C> visitor, C context);
 
-        // Minimal Type from "com.facebook.presto.spi.type.Type"
         Type getType();
     }
 
-    // 1C) Minimal Type interface (like com.facebook.presto.spi.type.Type)
     interface Type
     {
         String getDisplayName();
     }
 
-    // 1D) Minimal PlanNode
     interface PlanNode
     {
         String getId();
@@ -55,45 +46,39 @@ public class ConvertDateTimestampToTimestampBoundsTest
         <R, C> R accept(PlanVisitor<R, C> visitor, C context);
     }
 
-    // 1E) Minimal PlanVisitor
+
     interface PlanVisitor<R, C>
     {
         R visitPlan(PlanNode node, C context);
     }
 
-    // 1F) Minimal FilterNode
+
     interface FilterNode extends PlanNode
     {
         RowExpression getPredicate();
     }
 
-    // 1G) The “Rule” interface with Pattern, Captures, Context, etc.
+
     interface Rule<T extends PlanNode>
     {
-        Pattern<T> getPattern();
+        Pattern getPattern();
 
         Result apply(T node, Captures captures, Context context);
 
-        // Minimal sub-interfaces/structs
+
         interface Context {}
         interface Result {}
     }
 
     interface Captures {}
 
-    interface Pattern<T> {}
+    interface Pattern {}
 
-    // 1H) A utility that returns a "filter" pattern
-    static <T extends FilterNode> Pattern<T> filter()
+
+    static Pattern filter()
     {
-        return new Pattern<T>() {};
+        return new Pattern() {};
     }
-
-    //
-    // -------------------------------------------------------------------
-    //  2) Minimal "FunctionAndTypeManager" stubs
-    // -------------------------------------------------------------------
-    //
 
     /**
      * Simulates com.facebook.presto.metadata.FunctionAndTypeManager.
@@ -106,9 +91,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
     }
 
     interface FunctionAndTypeResolver
-    {
-        // put anything you need here, or leave it empty
-    }
+    {}
 
     /**
      * A dummy implementation. The rule just needs an instance to call
@@ -127,11 +110,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
     {
     }
 
-    //
-    // -------------------------------------------------------------------
-    //  3) Minimal *Result* implementation so the Rule can return something
-    // -------------------------------------------------------------------
-    //
 
     static class MyResult implements Rule.Result
     {
@@ -253,7 +231,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
     // -------------------------------------------------------------------
     //
 
-    // A minimal Type implementation for testing
     static class DummyType implements Type
     {
         private final String name;
@@ -313,12 +290,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
 
         @Override
-        public boolean equals(Object o)
-        {
-            return this == o;
-        }
-
-        @Override
         public int hashCode()
         {
             return System.identityHashCode(this);
@@ -361,12 +332,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
 
         @Override
-        public boolean equals(Object o)
-        {
-            return this == o;
-        }
-
-        @Override
         public int hashCode()
         {
             return System.identityHashCode(this);
@@ -404,12 +369,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
 
         @Override
-        public boolean equals(Object o)
-        {
-            return this == o;
-        }
-
-        @Override
         public int hashCode()
         {
             return System.identityHashCode(this);
@@ -422,17 +381,12 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
     }
 
-    //
-    // -------------------------------------------------------------------
-    //  6) The actual ConvertDateTimestampToTimestampBounds rule
-    // -------------------------------------------------------------------
-    //
 
     /**
      * Minimal version of the rule that checks for
      *    date(ts_col) = DATE 'yyyy-mm-dd'
      * and rewrites to a pair of comparisons on timestamps.
-     *
+     * <p>
      * Extended to also support:
      *    year(ts_col) = <numeric literal>
      * and
@@ -441,8 +395,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
      */
     static class ConvertDateTimestampToTimestampBounds implements Rule<FilterNode>
     {
-        // We rely on the "filter()" pattern above
-        private static final Pattern<FilterNode> PATTERN = filter();
+        private static final Pattern PATTERN = filter();
 
         private final FunctionAndTypeManager functionAndTypeManager;
 
@@ -452,7 +405,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
 
         @Override
-        public Pattern<FilterNode> getPattern()
+        public Pattern getPattern()
         {
             return PATTERN;
         }
@@ -473,14 +426,14 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
         private RowExpression rewritePredicate(RowExpression expression)
         {
-            // Only handling binary comparison expressions
+
             if (!(expression instanceof DummyCallExpression)) {
                 return expression;
             }
 
             DummyCallExpression call = (DummyCallExpression) expression;
 
-            // Proceed only for equality comparisons of two arguments
+
             if (!call.getDisplayName().equals(EQUAL.getFunctionName()) || call.getArguments().size() != 2) {
                 return expression;
             }
@@ -590,12 +543,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
 
             // If none matched, return the expression unchanged.
             return expression;
-        }
-
-        private DummyCallExpression createAndExpression(RowExpression left, RowExpression right)
-        {
-            // For simplicity in this dummy implementation, we reuse the constructor.
-            return new DummyCallExpression("and", "boolean", Arrays.asList(left, right));
         }
 
         // --- Date Function Extraction (for date()) ---
@@ -730,16 +677,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
     @Test
     public void testRewriteDateComparison()
     {
-        ConvertDateTimestampToTimestampBounds rule =
-                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
-
-        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
-        RowExpression dateCall = new DummyCallExpression("date","date",Collections.singletonList(tsCol));
-        RowExpression dateLit  = new DummyConstantExpression("2020-01-01","date");
-        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(dateCall,dateLit));
-        FilterNode filter      = new DummyFilterNode("filterDate", new DummyPlanNode("src"), equals);
-
-        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        MyResult result = getResult();
         Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
         DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
@@ -752,9 +690,33 @@ public class ConvertDateTimestampToTimestampBoundsTest
         Assertions.assertEquals("<",  lt.getDisplayName());
     }
 
+    private static MyResult getResult() {
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
+        RowExpression dateCall = new DummyCallExpression("date","date",Collections.singletonList(tsCol));
+        RowExpression dateLit  = new DummyConstantExpression("2020-01-01","date");
+        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(dateCall,dateLit));
+        FilterNode filter      = new DummyFilterNode("filterDate", new DummyPlanNode("src"), equals);
+
+        return (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+    }
+
     @Test
     public void testRewriteSwappedPredicate()
     {
+        MyResult result = getMyResult();
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
+
+        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
+        Assertions.assertEquals(2, andCall.getArguments().size());
+        Assertions.assertEquals(">=", ((DummyCallExpression) andCall.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals("<",  ((DummyCallExpression) andCall.getArguments().get(1)).getDisplayName());
+    }
+
+    private static MyResult getMyResult() {
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
@@ -764,14 +726,7 @@ public class ConvertDateTimestampToTimestampBoundsTest
         RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(dateLit,dateCall));
         FilterNode filter      = new DummyFilterNode("filterSwapped", new DummyPlanNode("src"), equals);
 
-        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
-        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
-
-        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
-        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size());
-        Assertions.assertEquals(">=", ((DummyCallExpression) andCall.getArguments().get(0)).getDisplayName());
-        Assertions.assertEquals("<",  ((DummyCallExpression) andCall.getArguments().get(1)).getDisplayName());
+        return (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
     }
 
     // -------------------   year()   -------------------
@@ -900,8 +855,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
     // Constants for comparison operators
     // -------------------------------
     private static final Operator EQUAL = Operator.EQUAL;
-    private static final Operator GREATER_THAN_OR_EQUAL = Operator.GREATER_THAN_OR_EQUAL;
-    private static final Operator LESS_THAN = Operator.LESS_THAN;
 
     // Minimal enum to simulate operator types for testing.
     enum Operator {
@@ -931,9 +884,6 @@ public class ConvertDateTimestampToTimestampBoundsTest
     @Test
     public void testRewriteHourComparison()
     {
-        // hour(ts_col) = '2020-05-12-07'
-        //   --> ts_col >= '2020-05-12 07:00:00.000'
-        //   AND ts_col <  '2020-05-12 08:00:00.000'
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 

@@ -23,7 +23,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.List;
 import java.util.Optional;
 
 import static com.facebook.presto.common.function.OperatorType.GREATER_THAN_OR_EQUAL;
@@ -32,7 +31,6 @@ import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
 import static com.facebook.presto.matching.Pattern.typeOf;
 import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.AND;
 import static com.facebook.presto.sql.relational.Expressions.comparisonExpression;
-import static com.facebook.presto.sql.relational.Expressions.constant;
 import static java.util.Objects.requireNonNull;
 
 public class ConvertDateTimestampToTimestampBounds
@@ -84,16 +82,13 @@ public class ConvertDateTimestampToTimestampBounds
             rewritten = Optional.ofNullable(rewriteExtendedEquality(left, right));
         }
 
-        if (!rewritten.isPresent()) {
-            return Result.empty();
-        }
-
-        return Result.ofPlanNode(
+        return rewritten.map(rowExpression -> Result.ofPlanNode(
                 new FilterNode(
                         node.getSourceLocation(),
                         node.getId(),
                         node.getSource(),
-                        rewritten.get()));
+                        rowExpression))).orElseGet(Result::empty);
+
     }
 
     /* ====================================================================== */
@@ -180,7 +175,7 @@ public class ConvertDateTimestampToTimestampBounds
                 OperatorType.CAST.name(),
                 cast,
                 TimestampType.TIMESTAMP,
-                ImmutableList.<RowExpression>of(dateConstant));
+                ImmutableList.of(dateConstant));
     }
 
     /* ====================================================================== */
@@ -294,7 +289,7 @@ public class ConvertDateTimestampToTimestampBounds
                 left.getSourceLocation(),
                 AND,
                 BOOLEAN,
-                ImmutableList.<RowExpression>of(left, right));
+                ImmutableList.of(left, right));
     }
 
     private ConstantExpression timestampLiteral(String text)
@@ -367,10 +362,10 @@ public class ConvertDateTimestampToTimestampBounds
 
     private Optional<ConstantExpression> extractTimestampLiteral(RowExpression a, RowExpression b)
     {
-        if (a instanceof ConstantExpression && ((ConstantExpression) a).getType() instanceof TimestampType) {
+        if (a instanceof ConstantExpression && a.getType() instanceof TimestampType) {
             return Optional.of((ConstantExpression) a);
         }
-        if (b instanceof ConstantExpression && ((ConstantExpression) b).getType() instanceof TimestampType) {
+        if (b instanceof ConstantExpression && b.getType() instanceof TimestampType) {
             return Optional.of((ConstantExpression) b);
         }
         return Optional.empty();
