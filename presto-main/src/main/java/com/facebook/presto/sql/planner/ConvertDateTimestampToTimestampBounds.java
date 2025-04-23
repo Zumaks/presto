@@ -215,26 +215,39 @@ public class ConvertDateTimestampToTimestampBounds
         }
 
         /* ---------- hour() ---------- */
-        Optional<RowExpression> hourCol = extractFunctionArgument("hour", left, right);
+        Optional<RowExpression> hourCol  = extractFunctionArgument("hour", left, right);
         Optional<ConstantExpression> hourLit = extractStringLiteral(left, right);
+
         if (hourCol.isPresent() && hourLit.isPresent()) {
-            String[] p = hourLit.get().getValue().toString().split("-");
-            if (p.length == 4) {
-                int yy = Integer.parseInt(p[0]);
-                int mm = Integer.parseInt(p[1]);
-                int dd = Integer.parseInt(p[2]);
-                int hh = Integer.parseInt(p[3]);
+            // Expected literal format:  YYYY-MM-DD-HH
+            String hourToken = hourLit.get().getValue().toString();
+            String[] parts = hourToken.split("-");
+            if (parts.length == 4) {
+                try {
+                    int yy = Integer.parseInt(parts[0]);
+                    int mm = Integer.parseInt(parts[1]);
+                    int dd = Integer.parseInt(parts[2]);
+                    int hh = Integer.parseInt(parts[3]);
 
-                String lower = String.format("%04d-%02d-%02d %02d:00:00.000", yy, mm, dd, hh);
+            /* build lower bound and compute upper via LocalDateTime math
+               so 2020-05-31-23 rolls over to 2020-06-01-00 correctly       */
+                    LocalDateTime lowerDt = LocalDateTime.of(yy, mm, dd, hh, 0, 0, 0);
+                    String  lower = lowerDt.format(TS_FMT);
+                    String  upper = lowerDt.plusHours(1).format(TS_FMT);
 
-                int nextHour = (hh + 1) % 24;
-                int nextDay  = dd + (hh == 23 ? 1 : 0);   // naive day rollover; month/year edge ignored
-
-                String upper = String.format("%04d-%02d-%02d %02d:00:00.000", yy, mm, nextDay, nextHour);
-
-                return createAndExpression(
-                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, hourCol.get(), timestampLiteral(lower)),
-                        comparisonExpression(functionResolution, LESS_THAN,            hourCol.get(), timestampLiteral(upper)));
+                    return createAndExpression(
+                            comparisonExpression(functionResolution,
+                                    GREATER_THAN_OR_EQUAL,
+                                    hourCol.get(),
+                                    timestampLiteral(lower)),
+                            comparisonExpression(functionResolution,
+                                    LESS_THAN,
+                                    hourCol.get(),
+                                    timestampLiteral(upper)));
+                }
+                catch (NumberFormatException | java.time.DateTimeException ignore) {
+                    /* fall through – let the original predicate stand */
+                }
             }
         }
 
