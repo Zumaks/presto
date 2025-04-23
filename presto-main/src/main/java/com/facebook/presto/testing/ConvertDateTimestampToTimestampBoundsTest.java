@@ -1,5 +1,9 @@
 package com.facebook.presto.testing;
 
+import com.facebook.presto.common.function.OperatorType;
+import com.facebook.presto.spi.relation.CallExpression;
+import com.facebook.presto.spi.relation.ConstantExpression;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -722,170 +726,105 @@ public class ConvertDateTimestampToTimestampBoundsTest
         }
     }
 
-    //
-    // -------------------------------------------------------------------
-    //  7) Actual JUnit tests exercising the rule
-    // -------------------------------------------------------------------
-    //
 
     @Test
     public void testRewriteDateComparison()
     {
-        // Create the rule with a dummy manager
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        // Build a predicate: date(ts_col) = DATE '2020-01-01'
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression dateCall = new DummyCallExpression("date", "date", Collections.singletonList(tsCol));
-        RowExpression dateLiteral = new DummyConstantExpression("2020-01-01", "date");
-        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(dateCall, dateLiteral));
+        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
+        RowExpression dateCall = new DummyCallExpression("date","date",Collections.singletonList(tsCol));
+        RowExpression dateLit  = new DummyConstantExpression("2020-01-01","date");
+        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(dateCall,dateLit));
+        FilterNode filter      = new DummyFilterNode("filterDate", new DummyPlanNode("src"), equals);
 
-        // Create a FilterNode with that predicate
-        FilterNode filterNode = new DummyFilterNode("filter1", new DummyPlanNode("source"), equalsCall);
+        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        // Apply the rule
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-
-        // Check that we got a transformation
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite");
-
-        // Get the transformed node
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        RowExpression newPredicate = transformed.getPredicate();
-
-        // The new predicate should be "and(..., ...)"
-        Assertions.assertTrue(newPredicate instanceof DummyCallExpression);
-        DummyCallExpression andCall = (DummyCallExpression) newPredicate;
+        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
         Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND");
+        Assertions.assertEquals(2, andCall.getArguments().size());
 
-        // Check the first part: >=
-        RowExpression lowerBound = andCall.getArguments().get(0);
-        Assertions.assertTrue(lowerBound instanceof DummyCallExpression);
-        Assertions.assertEquals(">=", ((DummyCallExpression) lowerBound).getDisplayName());
-
-        // Check the second part: <
-        RowExpression upperBound = andCall.getArguments().get(1);
-        Assertions.assertTrue(upperBound instanceof DummyCallExpression);
-        Assertions.assertEquals("<", ((DummyCallExpression) upperBound).getDisplayName());
+        DummyCallExpression ge = (DummyCallExpression) andCall.getArguments().get(0);
+        DummyCallExpression lt = (DummyCallExpression) andCall.getArguments().get(1);
+        Assertions.assertEquals(">=", ge.getDisplayName());
+        Assertions.assertEquals("<",  lt.getDisplayName());
     }
 
     @Test
     public void testRewriteSwappedPredicate()
     {
-        // Test that the rule still applies when the date literal and date function are swapped:
-        // DATE '2020-01-01' = date(ts_col)
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression dateCall = new DummyCallExpression("date", "date", Collections.singletonList(tsCol));
-        RowExpression dateLiteral = new DummyConstantExpression("2020-01-01", "date");
-        // Swap the order: literal comes first
-        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(dateLiteral, dateCall));
+        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
+        RowExpression dateCall = new DummyCallExpression("date","date",Collections.singletonList(tsCol));
+        RowExpression dateLit  = new DummyConstantExpression("2020-01-01","date");
+        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(dateLit,dateCall));
+        FilterNode filter      = new DummyFilterNode("filterSwapped", new DummyPlanNode("src"), equals);
 
-        FilterNode filterNode = new DummyFilterNode("filterSwapped", new DummyPlanNode("source"), equalsCall);
+        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped order");
-
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
         Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND");
+        Assertions.assertEquals(2, andCall.getArguments().size());
+        Assertions.assertEquals(">=", ((DummyCallExpression) andCall.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals("<",  ((DummyCallExpression) andCall.getArguments().get(1)).getDisplayName());
     }
 
-    // -------------------------------
-    // New tests for the year() function
-    // -------------------------------
+    // -------------------   year()   -------------------
 
     @Test
     public void testRewriteYearComparison()
     {
-        // Create the rule with a dummy manager; now testing year rewriting:
-        // year(ts_col) = 1984  -->  ts_col >= '1984-01-01 00:00:00.000'
-        //                        and ts_col <  '1985-01-01 00:00:00.000'
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        // Build a predicate: year(ts_col) = 1984
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression yearCall = new DummyCallExpression("year", "integer", Collections.singletonList(tsCol));
-        RowExpression yearLiteral = new DummyConstantExpression(1984, "integer");
-        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(yearCall, yearLiteral));
+        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
+        RowExpression yearCall = new DummyCallExpression("year","integer",Collections.singletonList(tsCol));
+        RowExpression yearLit  = new DummyConstantExpression(1984,"integer");
+        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(yearCall,yearLit));
+        FilterNode filter      = new DummyFilterNode("filterYear", new DummyPlanNode("src"), equals);
 
-        // Create a FilterNode with that predicate
-        FilterNode filterNode = new DummyFilterNode("filterYear", new DummyPlanNode("source"), equalsCall);
+        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        // Apply the rule
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-
-        // Check that it got a transformation
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for year predicate");
-
-        // Get the transformed node
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        RowExpression newPredicate = transformed.getPredicate();
-
-        // The new predicate should be an "and" expression combining two comparisons
-        Assertions.assertTrue(newPredicate instanceof DummyCallExpression, "New predicate should be a call expression");
-        DummyCallExpression andCall = (DummyCallExpression) newPredicate;
+        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
         Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for year predicate");
+        Assertions.assertEquals(2, andCall.getArguments().size());
 
-        // Check the first part: >= comparison
-        RowExpression lowerBound = andCall.getArguments().get(0);
-        Assertions.assertTrue(lowerBound instanceof DummyCallExpression, "Lower bound should be a call expression");
-        DummyCallExpression lowerComparison = (DummyCallExpression) lowerBound;
-        Assertions.assertEquals(">=", lowerComparison.getDisplayName());
+        DummyCallExpression ge = (DummyCallExpression) andCall.getArguments().get(0);
+        DummyCallExpression lt = (DummyCallExpression) andCall.getArguments().get(1);
+        Assertions.assertEquals(">=", ge.getDisplayName());
+        Assertions.assertEquals("<",  lt.getDisplayName());
 
-        // The right-hand side of the lower comparison should be a constant with value "1984-01-01 00:00:00.000"
-        RowExpression lowerConstant = lowerComparison.getArguments().get(1);
-        Assertions.assertTrue(lowerConstant instanceof DummyConstantExpression);
-        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerConstant;
-        Assertions.assertEquals("1984-01-01 00:00:00.000", lowerConst.getValue().toString());
-
-        // Check the second part: < comparison
-        RowExpression upperBound = andCall.getArguments().get(1);
-        Assertions.assertTrue(upperBound instanceof DummyCallExpression, "Upper bound should be a call expression");
-        DummyCallExpression upperComparison = (DummyCallExpression) upperBound;
-        Assertions.assertEquals("<", upperComparison.getDisplayName());
-
-        // The right-hand side of the upper comparison should be a constant with value "1985-01-01 00:00:00.000"
-        RowExpression upperConstant = upperComparison.getArguments().get(1);
-        Assertions.assertTrue(upperConstant instanceof DummyConstantExpression);
-        DummyConstantExpression upperConst = (DummyConstantExpression) upperConstant;
-        Assertions.assertEquals("1985-01-01 00:00:00.000", upperConst.getValue().toString());
+        DummyConstantExpression geConst = (DummyConstantExpression) ge.getArguments().get(1);
+        DummyConstantExpression ltConst = (DummyConstantExpression) lt.getArguments().get(1);
+        Assertions.assertEquals("1984-01-01 00:00:00.000", geConst.getValue().toString());
+        Assertions.assertEquals("1985-01-01 00:00:00.000", ltConst.getValue().toString());
     }
 
     @Test
     public void testRewriteSwappedYearPredicate()
     {
-        // Test that the rule applies when the year literal and year() function are swapped:
-        // i.e., 1984 = year(ts_col)
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression yearCall = new DummyCallExpression("year", "integer", Collections.singletonList(tsCol));
-        RowExpression yearLiteral = new DummyConstantExpression(1984, "integer");
-        // Swap order: literal comes first
-        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(yearLiteral, yearCall));
+        RowExpression tsCol    = new DummyVariableExpression("ts_col","timestamp");
+        RowExpression yearCall = new DummyCallExpression("year","integer",Collections.singletonList(tsCol));
+        RowExpression yearLit  = new DummyConstantExpression(1984,"integer");
+        RowExpression equals   = new DummyCallExpression("=","boolean",Arrays.asList(yearLit,yearCall));
+        FilterNode filter      = new DummyFilterNode("filterSwappedYear", new DummyPlanNode("src"), equals);
 
-        FilterNode filterNode = new DummyFilterNode("filterSwappedYear", new DummyPlanNode("source"), equalsCall);
+        MyResult result = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped year predicate");
-
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
+        DummyCallExpression andCall = (DummyCallExpression) ((FilterNode) result.getPlanNode()).getPredicate();
         Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped year predicate");
+        Assertions.assertEquals(">=", ((DummyCallExpression) andCall.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals("<",  ((DummyCallExpression) andCall.getArguments().get(1)).getDisplayName());
     }
 
     // -------------------------------
