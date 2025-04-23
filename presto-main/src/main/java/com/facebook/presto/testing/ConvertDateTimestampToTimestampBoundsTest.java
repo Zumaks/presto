@@ -887,56 +887,148 @@ public class ConvertDateTimestampToTimestampBoundsTest
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        RowExpression tsCol= new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression hourCall= new DummyCallExpression("hour", "integer", Collections.singletonList(tsCol));
-        RowExpression hourLiteral= new DummyConstantExpression("2020-05-12-07", "varchar");
-        RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(hourCall, hourLiteral));
+        RowExpression tsCol     = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression hourCall  = new DummyCallExpression("hour", "integer",
+                Collections.singletonList(tsCol));
+        RowExpression hourLit   = new DummyConstantExpression("2020-05-12-07", "varchar");
+        RowExpression equals    = new DummyCallExpression("=", "boolean",
+                Arrays.asList(hourCall, hourLit));
 
-        FilterNode filterNode = new DummyFilterNode("filterHour", new DummyPlanNode("source"), equalsCall);
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for hour predicate");
+        FilterNode filter = new DummyFilterNode("filterHour", new DummyPlanNode("src"), equals);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        DummyFilterNode transformed = (DummyFilterNode) ((MyResult) result).getPlanNode();
-        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
-        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for hour predicate");
+        SpecialFormExpression andForm =
+                (SpecialFormExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+        Assertions.assertEquals(2, andForm.getArguments().size());
 
-        // --- Lower bound check: ts_col >= '2020-05-12 07:00:00.000'
-        DummyCallExpression lowerComp = (DummyCallExpression) andCall.getArguments().get(0);
-        Assertions.assertEquals(">=", lowerComp.getDisplayName());
-        // verify the constant
-        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerComp.getArguments().get(1);
-        Assertions.assertEquals("2020-05-12 07:00:00.000", lowerConst.getValue().toString());
+        CallExpression ge = (CallExpression) andForm.getArguments().get(0);
+        Assertions.assertEquals(OperatorType.GREATER_THAN_OR_EQUAL.name(), ge.getDisplayName());
+        ConstantExpression geConst = (ConstantExpression) ge.getArguments().get(1);
+        Assertions.assertEquals("2020-05-12 07:00:00.000", geConst.getValue().toString());
 
-        // --- Upper bound check: ts_col < '2020-05-12 08:00:00.000'
-        DummyCallExpression upperComp = (DummyCallExpression) andCall.getArguments().get(1);
-        Assertions.assertEquals("<", upperComp.getDisplayName());
-        DummyConstantExpression upperConst = (DummyConstantExpression) upperComp.getArguments().get(1);
-        Assertions.assertEquals("2020-05-12 08:00:00.000", upperConst.getValue().toString());
+        CallExpression lt = (CallExpression) andForm.getArguments().get(1);
+        Assertions.assertEquals(OperatorType.LESS_THAN.name(), lt.getDisplayName());
+        ConstantExpression ltConst = (ConstantExpression) lt.getArguments().get(1);
+        Assertions.assertEquals("2020-05-12 08:00:00.000", ltConst.getValue().toString());
     }
 
     @Test
     public void testRewriteSwappedHourPredicate()
     {
-        // '2020-05-12-07' = hour(ts_col)
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        RowExpression tsCol= new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression hourCall= new DummyCallExpression("hour", "integer", Collections.singletonList(tsCol));
-        RowExpression hourLiteral= new DummyConstantExpression("2020-05-12-07", "varchar");
-        RowExpression equalsCall= new DummyCallExpression("=", "boolean",
-                Arrays.asList(hourLiteral, hourCall));
+        RowExpression tsCol    = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression hourCall = new DummyCallExpression("hour", "integer",
+                Collections.singletonList(tsCol));
+        RowExpression hourLit  = new DummyConstantExpression("2020-05-12-07", "varchar");
+        RowExpression equals   = new DummyCallExpression("=", "boolean",
+                Arrays.asList(hourLit, hourCall));
 
-        FilterNode filterNode = new DummyFilterNode("filterSwappedHour", new DummyPlanNode("source"), equalsCall);
-        Rule.Result result= rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped hour predicate");
+        FilterNode filter = new DummyFilterNode("filterSwappedHour", new DummyPlanNode("src"), equals);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        DummyCallExpression andCall = (DummyCallExpression) ((DummyFilterNode) ((MyResult) result).getPlanNode())
-                .getPredicate();
-        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped hour predicate");
+        SpecialFormExpression andForm =
+                (SpecialFormExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+        Assertions.assertEquals(2, andForm.getArguments().size());
+        Assertions.assertEquals(OperatorType.GREATER_THAN_OR_EQUAL.name(),
+                ((CallExpression) andForm.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals(OperatorType.LESS_THAN.name(),
+                ((CallExpression) andForm.getArguments().get(1)).getDisplayName());
     }
+
+    // ---------------------------------------------------------------------
+    // date_trunc() rule change testing
+    // ---------------------------------------------------------------------
+
+    @Test
+    public void testRewriteDateTruncComparison()
+    {
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol  = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression unit   = new DummyConstantExpression("day", "varchar");  // first arg
+        RowExpression dtCall = new DummyCallExpression("date_trunc", "timestamp",
+                Arrays.asList(unit, tsCol));
+
+        RowExpression tsLit  = new DummyConstantExpression("2024-03-12 00:00:00.000", "timestamp");
+        RowExpression equals = new DummyCallExpression("=", "boolean",
+                Arrays.asList(dtCall, tsLit));
+
+        FilterNode filter = new DummyFilterNode("filterDt", new DummyPlanNode("src"), equals);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
+
+        SpecialFormExpression andForm =
+                (SpecialFormExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+
+        CallExpression ge = (CallExpression) andForm.getArguments().get(0);
+        Assertions.assertEquals("2024-03-12 00:00:00.000",
+                ((ConstantExpression) ge.getArguments().get(1)).getValue().toString());
+
+        CallExpression lt = (CallExpression) andForm.getArguments().get(1);
+        Assertions.assertEquals("2024-03-13 00:00:00.000",
+                ((ConstantExpression) lt.getArguments().get(1)).getValue().toString());
+    }
+
+
+    @Test
+    public void testRewriteSwappedDateTruncPredicate()
+    {
+        ConvertDateTimestampToTimestampBounds rule =
+                new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
+
+        RowExpression tsCol  = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression unit   = new DummyConstantExpression("day", "varchar");
+        RowExpression dtCall = new DummyCallExpression("date_trunc", "timestamp",
+                Arrays.asList(unit, tsCol));
+        RowExpression tsLit  = new DummyConstantExpression("2024-03-12 00:00:00.000", "timestamp");
+
+        RowExpression equals = new DummyCallExpression("=", "boolean",
+                Arrays.asList(tsLit, dtCall));
+
+        FilterNode filter = new DummyFilterNode("filterSwappedDt", new DummyPlanNode("src"), equals);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
+
+        SpecialFormExpression andForm =
+                (SpecialFormExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+        Assertions.assertEquals(2, andForm.getArguments().size());
+        Assertions.assertEquals(OperatorType.GREATER_THAN_OR_EQUAL.name(),
+                ((CallExpression) andForm.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals(OperatorType.LESS_THAN.name(),
+                ((CallExpression) andForm.getArguments().get(1)).getDisplayName());
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
 
