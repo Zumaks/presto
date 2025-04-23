@@ -197,8 +197,8 @@ public class ConvertDateTimestampToTimestampBounds
             String lower = String.format("%d-01-01 00:00:00.000", y);
             String upper = String.format("%d-01-01 00:00:00.000", y + 1);
             return createAndExpression(
-                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, yearCol.get(), constant(lower, TimestampType.TIMESTAMP)),
-                    comparisonExpression(functionResolution, LESS_THAN,            yearCol.get(), constant(upper, TimestampType.TIMESTAMP)));
+                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, yearCol.get(), timestampLiteral(lower)),
+                    comparisonExpression(functionResolution, LESS_THAN,            yearCol.get(), timestampLiteral(upper)));
         }
 
         /* ---------- month() ---------- */
@@ -214,8 +214,8 @@ public class ConvertDateTimestampToTimestampBounds
                         ? String.format("%d-01-01 00:00:00.000", yy + 1)
                         : String.format("%d-%02d-01 00:00:00.000", yy, mm + 1);
                 return createAndExpression(
-                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, monthCol.get(), constant(lower, TimestampType.TIMESTAMP)),
-                        comparisonExpression(functionResolution, LESS_THAN,            monthCol.get(), constant(upper, TimestampType.TIMESTAMP)));
+                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, monthCol.get(), timestampLiteral(lower)),
+                        comparisonExpression(functionResolution, LESS_THAN,            monthCol.get(), timestampLiteral(upper)));
             }
         }
 
@@ -238,8 +238,8 @@ public class ConvertDateTimestampToTimestampBounds
                 String upper = String.format("%04d-%02d-%02d %02d:00:00.000", yy, mm, nextDay, nextHour);
 
                 return createAndExpression(
-                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, hourCol.get(), constant(lower, TimestampType.TIMESTAMP)),
-                        comparisonExpression(functionResolution, LESS_THAN,            hourCol.get(), constant(upper, TimestampType.TIMESTAMP)));
+                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, hourCol.get(), timestampLiteral(lower)),
+                        comparisonExpression(functionResolution, LESS_THAN,            hourCol.get(), timestampLiteral(upper)));
             }
         }
 
@@ -276,8 +276,8 @@ public class ConvertDateTimestampToTimestampBounds
             }
 
             return createAndExpression(
-                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, tsColumn, constant(baseStr,             TimestampType.TIMESTAMP)),
-                    comparisonExpression(functionResolution, LESS_THAN,            tsColumn, constant(next.format(TS_FMT), TimestampType.TIMESTAMP)));
+                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, tsColumn, timestampLiteral(baseStr)),
+                    comparisonExpression(functionResolution, LESS_THAN,            tsColumn, timestampLiteral(next.format(TS_FMT))));
         }
 
         /* nothing matched */
@@ -295,6 +295,18 @@ public class ConvertDateTimestampToTimestampBounds
                 AND,
                 BOOLEAN,
                 ImmutableList.<RowExpression>of(left, right));
+    }
+
+    private ConstantExpression timestampLiteral(String text)
+    {
+        LocalDateTime ldt = LocalDateTime.parse(text, TS_FMT);
+        long epochMillis  = ldt.atZone(java.time.ZoneOffset.UTC)
+                .toInstant()
+                .toEpochMilli();
+        return new ConstantExpression(
+                null ,
+                epochMillis,
+                TimestampType.TIMESTAMP);
     }
 
     private RowExpression unwrapCasts(RowExpression expr)
