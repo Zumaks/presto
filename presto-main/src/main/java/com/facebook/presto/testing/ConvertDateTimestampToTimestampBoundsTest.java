@@ -834,84 +834,66 @@ public class ConvertDateTimestampToTimestampBoundsTest
     @Test
     public void testRewriteMonthComparison()
     {
-        // Create the rule with a dummy manager; now testing month rewriting:
-        // month(ts_col) = '2020-05'  -->  ts_col >= '2020-05-01 00:00:00.000'
-        //                              and ts_col <  '2020-06-01 00:00:00.000'
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        // Build a predicate: month(ts_col) = '2020-05'
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression monthCall = new DummyCallExpression("month", "timestamp", Collections.singletonList(tsCol));
-        // Use "varchar" or similar for the literal type if needed.
-        RowExpression monthLiteral = new DummyConstantExpression("2020-05", "varchar");
+        RowExpression tsCol      = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression monthCall  = new DummyCallExpression("month", "integer",
+                Collections.singletonList(tsCol));
+        RowExpression monthLit   = new DummyConstantExpression("2020-05", "varchar");
         RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(monthCall, monthLiteral));
+                Arrays.asList(monthCall, monthLit));
 
-        // Create a FilterNode with that predicate
-        FilterNode filterNode = new DummyFilterNode("filterMonth", new DummyPlanNode("source"), equalsCall);
+        FilterNode filter = new DummyFilterNode("filterMonth", new DummyPlanNode("src"), equalsCall);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        // Apply the rule
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
+        /* ───── verify predicate structure ───── */
+        RowExpression predicate = ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertInstanceOf(SpecialFormExpression.class, predicate);
+        SpecialFormExpression andForm = (SpecialFormExpression) predicate;
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+        Assertions.assertEquals(2, andForm.getArguments().size());
 
-        // Check that it got a transformation
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for month predicate");
+        /* child-0 : ts_col >= '2020-05-01 00:00:00.000' */
+        CallExpression ge = (CallExpression) andForm.getArguments().get(0);
+        Assertions.assertEquals(OperatorType.GREATER_THAN_OR_EQUAL.name(), ge.getDisplayName());
+        ConstantExpression geConst = (ConstantExpression) ge.getArguments().get(1);
+        Assertions.assertEquals("2020-05-01 00:00:00.000", geConst.getValue().toString());
 
-        // Get the transformed node
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        RowExpression newPredicate = transformed.getPredicate();
-
-        // The new predicate should be an "and" expression combining two comparisons
-        Assertions.assertTrue(newPredicate instanceof DummyCallExpression);
-        DummyCallExpression andCall = (DummyCallExpression) newPredicate;
-        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for month predicate");
-
-        // Check the first part: >= comparison with lower bound "2020-05-01 00:00:00.000"
-        RowExpression lowerBound = andCall.getArguments().get(0);
-        Assertions.assertTrue(lowerBound instanceof DummyCallExpression);
-        DummyCallExpression lowerComparison = (DummyCallExpression) lowerBound;
-        Assertions.assertEquals(">=", lowerComparison.getDisplayName());
-        RowExpression lowerConstant = lowerComparison.getArguments().get(1);
-        Assertions.assertTrue(lowerConstant instanceof DummyConstantExpression);
-        DummyConstantExpression lowerConst = (DummyConstantExpression) lowerConstant;
-        Assertions.assertEquals("2020-05-01 00:00:00.000", lowerConst.getValue().toString());
-
-        // Check the second part: < comparison with upper bound "2020-06-01 00:00:00.000"
-        RowExpression upperBound = andCall.getArguments().get(1);
-        Assertions.assertTrue(upperBound instanceof DummyCallExpression);
-        DummyCallExpression upperComparison = (DummyCallExpression) upperBound;
-        Assertions.assertEquals("<", upperComparison.getDisplayName());
-        RowExpression upperConstant = upperComparison.getArguments().get(1);
-        Assertions.assertTrue(upperConstant instanceof DummyConstantExpression);
-        DummyConstantExpression upperConst = (DummyConstantExpression) upperConstant;
-        Assertions.assertEquals("2020-06-01 00:00:00.000", upperConst.getValue().toString());
+        /* child-1 : ts_col <  '2020-06-01 00:00:00.000' */
+        CallExpression lt = (CallExpression) andForm.getArguments().get(1);
+        Assertions.assertEquals(OperatorType.LESS_THAN.name(), lt.getDisplayName());
+        ConstantExpression ltConst = (ConstantExpression) lt.getArguments().get(1);
+        Assertions.assertEquals("2020-06-01 00:00:00.000", ltConst.getValue().toString());
     }
 
     @Test
     public void testRewriteSwappedMonthPredicate()
     {
-        // Test that the rule applies when the month literal and month() function are swapped:
-        // i.e., '2020-05' = month(ts_col)
         ConvertDateTimestampToTimestampBounds rule =
                 new ConvertDateTimestampToTimestampBounds(new DummyFunctionAndTypeManager());
 
-        RowExpression tsCol = new DummyVariableExpression("ts_col", "timestamp");
-        RowExpression monthCall = new DummyCallExpression("month", "timestamp", Collections.singletonList(tsCol));
-        RowExpression monthLiteral = new DummyConstantExpression("2020-05", "varchar");
-        // Swap the order: literal comes first
+        RowExpression tsCol     = new DummyVariableExpression("ts_col", "timestamp");
+        RowExpression monthCall = new DummyCallExpression("month", "integer",
+                Collections.singletonList(tsCol));
+        RowExpression monthLit  = new DummyConstantExpression("2020-05", "varchar");
         RowExpression equalsCall = new DummyCallExpression("=", "boolean",
-                Arrays.asList(monthLiteral, monthCall));
+                Arrays.asList(monthLit, monthCall));
 
-        FilterNode filterNode = new DummyFilterNode("filterSwappedMonth", new DummyPlanNode("source"), equalsCall);
+        FilterNode filter = new DummyFilterNode("filterSwappedMonth", new DummyPlanNode("src"), equalsCall);
+        MyResult result   = (MyResult) rule.apply(filter, new Captures(){}, new Rule.Context(){});
+        Assertions.assertFalse(result.isEmpty(), "rewrite expected");
 
-        Rule.Result result = rule.apply(filterNode, new Captures() {}, new Rule.Context() {});
-        Assertions.assertFalse(((MyResult) result).isEmpty(), "Expected a rewrite for swapped month predicate");
+        SpecialFormExpression andForm =
+                (SpecialFormExpression) ((FilterNode) result.getPlanNode()).getPredicate();
+        Assertions.assertEquals(SpecialFormExpression.Form.AND, andForm.getForm());
+        Assertions.assertEquals(2, andForm.getArguments().size());
 
-        FilterNode transformed = (FilterNode) ((MyResult) result).getPlanNode();
-        DummyCallExpression andCall = (DummyCallExpression) transformed.getPredicate();
-        Assertions.assertEquals("and", andCall.getDisplayName().toLowerCase());
-        Assertions.assertEquals(2, andCall.getArguments().size(), "Expected two parts in the AND for swapped month predicate");
+        Assertions.assertEquals(OperatorType.GREATER_THAN_OR_EQUAL.name(),
+                ((CallExpression) andForm.getArguments().get(0)).getDisplayName());
+        Assertions.assertEquals(OperatorType.LESS_THAN.name(),
+                ((CallExpression) andForm.getArguments().get(1)).getDisplayName());
     }
 
     // -------------------------------
