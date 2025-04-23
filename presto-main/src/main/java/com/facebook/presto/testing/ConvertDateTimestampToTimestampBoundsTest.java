@@ -128,33 +128,36 @@ public class ConvertDateTimestampToTimestampBoundsTest
     }
 
 
-    static class MyResult implements Rule.Result
+    static final class MyResult implements Rule.Result
     {
-        private final Optional<PlanNode> transformed;
+        private final PlanNode planNode;
 
-        private MyResult(Optional<PlanNode> transformed)
+        private MyResult(PlanNode planNode)
         {
-            this.transformed = transformed;
+            this.planNode = planNode;
         }
 
         static MyResult empty()
         {
-            return new MyResult(Optional.empty());
+            return new MyResult(null);
         }
 
         static MyResult ofPlanNode(PlanNode node)
         {
-            return new MyResult(Optional.of(node));
+            return new MyResult(node);
         }
 
-        public boolean isEmpty()
+        boolean isEmpty()
         {
-            return !transformed.isPresent();
+            return planNode == null;
         }
 
-        public PlanNode getPlanNode()
+        PlanNode getPlanNode()
         {
-            return transformed.get();
+            if (planNode == null) {
+                throw new IllegalStateException("Result is empty");
+            }
+            return planNode;
         }
     }
 
