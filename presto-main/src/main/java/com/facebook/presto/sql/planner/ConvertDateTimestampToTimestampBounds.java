@@ -1,9 +1,12 @@
 package com.facebook.presto.sql.planner;
-import com.facebook.presto.common.type.BooleanType;
-import com.facebook.presto.common.type.Type;
+
+import com.facebook.presto.common.function.OperatorType;
+import com.facebook.presto.common.type.DateType;
+import com.facebook.presto.common.type.TimestampType;
 import com.facebook.presto.hive.$internal.com.google.common.collect.ImmutableList;
 import com.facebook.presto.matching.Captures;
 import com.facebook.presto.matching.Pattern;
+import com.facebook.presto.metadata.CastType;
 import com.facebook.presto.metadata.FunctionAndTypeManager;
 import com.facebook.presto.spi.function.FunctionHandle;
 import com.facebook.presto.spi.function.StandardFunctionResolution;
@@ -11,33 +14,39 @@ import com.facebook.presto.spi.plan.FilterNode;
 import com.facebook.presto.spi.relation.CallExpression;
 import com.facebook.presto.spi.relation.ConstantExpression;
 import com.facebook.presto.spi.relation.RowExpression;
+import com.facebook.presto.spi.relation.SpecialFormExpression;
 import com.facebook.presto.sql.analyzer.FunctionAndTypeResolver;
 import com.facebook.presto.sql.planner.iterative.Rule;
 import com.facebook.presto.sql.relational.FunctionResolution;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Optional;
 
-import static com.facebook.presto.common.function.OperatorType.EQUAL;
 import static com.facebook.presto.common.function.OperatorType.GREATER_THAN_OR_EQUAL;
 import static com.facebook.presto.common.function.OperatorType.LESS_THAN;
-import static com.facebook.presto.common.type.TimestampType.TIMESTAMP;
-import static com.facebook.presto.sql.planner.plan.Patterns.filter;
+import static com.facebook.presto.common.type.BooleanType.BOOLEAN;
+import static com.facebook.presto.matching.Pattern.typeOf;
+import static com.facebook.presto.spi.relation.SpecialFormExpression.Form.AND;
 import static com.facebook.presto.sql.relational.Expressions.comparisonExpression;
 import static com.facebook.presto.sql.relational.Expressions.constant;
+import static java.util.Objects.requireNonNull;
 
 public class ConvertDateTimestampToTimestampBounds
         implements Rule<FilterNode>
 {
-    private static final Pattern<FilterNode> PATTERN = filter();
-    private static final Type BOOLEAN = BooleanType.BOOLEAN; // Reusable reference to BooleanType
+    private static final Pattern<FilterNode> PATTERN = typeOf(FilterNode.class);
+    private static final DateTimeFormatter TS_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
 
     private final FunctionAndTypeManager functionAndTypeManager;
     private final StandardFunctionResolution functionResolution;
 
     public ConvertDateTimestampToTimestampBounds(FunctionAndTypeManager functionAndTypeManager)
     {
-        this.functionAndTypeManager = functionAndTypeManager;
+        this.functionAndTypeManager = requireNonNull(functionAndTypeManager, "functionAndTypeManager is null");
         this.functionResolution = new FunctionResolution((FunctionAndTypeResolver) functionAndTypeManager);
     }
 
@@ -48,254 +57,207 @@ public class ConvertDateTimestampToTimestampBounds
     }
 
     @Override
-    public Result apply(FilterNode filter, Captures captures, Context context)
+    public Result apply(FilterNode node, Captures captures, Context context)
     {
-        RowExpression originalPredicate = filter.getPredicate();
-        RowExpression rewritten = rewritePredicate(originalPredicate);
-
-        if (rewritten.equals(originalPredicate)) {
+        RowExpression predicate = node.getPredicate();
+        if (!(predicate instanceof CallExpression)) {
             return Result.empty();
         }
 
-        FilterNode newFilter = new FilterNode(
-                filter.getSourceLocation(),
-                filter.getId(),
-                filter.getSource(),
-                rewritten);
+        CallExpression equality = (CallExpression) predicate;
+        if (!functionResolution.isEqualsFunction(equality.getFunctionHandle())
+                || equality.getArguments().size() != 2) {
+            return Result.empty();
+        }
 
-        return Result.ofPlanNode(newFilter);
+        RowExpression left  = unwrapCasts(equality.getArguments().get(0));
+        RowExpression right = unwrapCasts(equality.getArguments().get(1));
+
+        /* ---------- 1. date(...) = DATE 'lit' ------------------------------- */
+        Optional<RowExpression> rewritten = tryRewriteDateEquality(left, right);
+        if (!rewritten.isPresent()) {
+            rewritten = tryRewriteDateEquality(right, left);
+        }
+
+        /* ---------- 2. year/month/hour/date_trunc --------------------------- */
+        if (!rewritten.isPresent()) {
+            rewritten = Optional.ofNullable(rewriteExtendedEquality(left, right));
+        }
+
+        if (!rewritten.isPresent()) {
+            return Result.empty();
+        }
+
+        return Result.ofPlanNode(
+                new FilterNode(
+                        node.getSourceLocation(),
+                        node.getId(),
+                        node.getSource(),
+                        rewritten.get()));
     }
 
-    private RowExpression rewritePredicate(RowExpression expression)
+    /* ====================================================================== */
+    /* ===                           date()                                === */
+    /* ====================================================================== */
+
+    private Optional<RowExpression> tryRewriteDateEquality(RowExpression functionSide, RowExpression literalSide)
     {
-        // Only handling binary comparison expressions
-        if (!(expression instanceof CallExpression)) {
-            return expression;
+        if (!(functionSide instanceof CallExpression)) {
+            return Optional.empty();
+        }
+        CallExpression dateCall = (CallExpression) functionSide;
+        if (!"date".equalsIgnoreCase(dateCall.getDisplayName()) || dateCall.getArguments().size() != 1) {
+            return Optional.empty();
         }
 
-        CallExpression call = (CallExpression) expression;
-
-        // Proceed only for equality comparisons of exactly two arguments
-        if (!call.getDisplayName().equals(EQUAL.getFunctionName()) || call.getArguments().size() != 2) {
-            return expression;
+        RowExpression tsExpr = unwrapCasts(dateCall.getArguments().get(0));
+        if (!(tsExpr.getType() instanceof TimestampType)) {
+            return Optional.empty();
         }
 
-        RowExpression left = call.getArguments().get(0);
-        RowExpression right = call.getArguments().get(1);
-
-        // ===========================
-        // 1) date() logic
-        // ===========================
-        Optional<RowExpression> maybeDateCol = extractDateFunctionArgument(left, right);
-        Optional<ConstantExpression> maybeDateLiteral = extractDateLiteral(left, right);
-
-        if (maybeDateCol.isPresent() && maybeDateLiteral.isPresent()) {
-            String dateValue = maybeDateLiteral.get().getValue().toString();
-
-            // Lower bound: dateValue + " 00:00:00.000"
-            RowExpression lowerBound = comparisonExpression(
-                    functionResolution,
-                    GREATER_THAN_OR_EQUAL,
-                    maybeDateCol.get(),
-                    constant(dateValue + " 00:00:00.000", TIMESTAMP)
-            );
-
-            // Upper bound: dateValue + 1 day at "00:00:00.000"
-            // For example, "1984-01-08" → "1984-01-09"
-            RowExpression upperBound = comparisonExpression(
-                    functionResolution,
-                    LESS_THAN,
-                    maybeDateCol.get(),
-                    constant(dateValue + "+1 00:00:00.000", TIMESTAMP)
-            );
-
-            return createAndExpression(lowerBound, upperBound);
+        RowExpression maybeDateLiteral = unwrapDateLiteralIfConstant(literalSide);
+        if (!(maybeDateLiteral instanceof ConstantExpression)
+                || !(maybeDateLiteral.getType() instanceof DateType)) {
+            return Optional.empty();
         }
 
-        // ===========================
-        // 2) year() logic
-        // ===========================
-        Optional<RowExpression> maybeYearCol = extractYearFunctionArgument(left, right);
-        Optional<ConstantExpression> maybeYearLiteral = extractYearLiteral(left, right);
+        return rewriteDateRange(tsExpr, (ConstantExpression) maybeDateLiteral);
+    }
 
-        if (maybeYearCol.isPresent() && maybeYearLiteral.isPresent()) {
-            Object literalVal = maybeYearLiteral.get().getValue();
-            long year;
-            if (literalVal instanceof Number) {
-                year = ((Number) literalVal).longValue();
-            }
-            else {
-                return expression; // Not a valid numeric literal
-            }
-
-            // Lower bound: January 1, <year>
-            String lowerTimestamp = String.format("%d-01-01 00:00:00.000", year);
-            // Upper bound: January 1, <year + 1>
-            String upperTimestamp = String.format("%d-01-01 00:00:00.000", year + 1);
-
-            RowExpression lowerBound = comparisonExpression(
-                    functionResolution,
-                    GREATER_THAN_OR_EQUAL,
-                    maybeYearCol.get(),
-                    constant(lowerTimestamp, TIMESTAMP)
-            );
-
-            RowExpression upperBound = comparisonExpression(
-                    functionResolution,
-                    LESS_THAN,
-                    maybeYearCol.get(),
-                    constant(upperTimestamp, TIMESTAMP)
-            );
-
-            return createAndExpression(lowerBound, upperBound);
+    private RowExpression unwrapDateLiteralIfConstant(RowExpression expr)
+    {
+        /* Already a DATE constant */
+        if (expr instanceof ConstantExpression && expr.getType() instanceof DateType) {
+            return expr;
         }
 
-        // ===========================
-        // 3) month() logic
-        // ===========================
-        Optional<RowExpression> maybeMonthCol = extractMonthFunctionArgument(left, right);
-        Optional<ConstantExpression> maybeMonthLiteral = extractMonthLiteral(left, right);
-
-        if (maybeMonthCol.isPresent() && maybeMonthLiteral.isPresent()) {
-            // Assume literal is "YYYY-MM"
-            String monthValue = maybeMonthLiteral.get().getValue().toString();
-            String[] parts = monthValue.split("-");
-            if (parts.length != 2) {
-                return expression;
+        /* CAST('yyyy-MM-dd' AS date) */
+        if (expr instanceof CallExpression) {
+            CallExpression cast = (CallExpression) expr;
+            if (functionResolution.isCastFunction(cast.getFunctionHandle())
+                    && cast.getArguments().size() == 1
+                    && cast.getType() instanceof DateType
+                    && cast.getArguments().get(0) instanceof ConstantExpression) {
+                ConstantExpression arg = (ConstantExpression) cast.getArguments().get(0);
+                String text = arg.getValue().toString();
+                try {
+                    LocalDate ld = LocalDate.parse(text);
+                    long epochDay = ld.toEpochDay();
+                    return new ConstantExpression(expr.getSourceLocation(), epochDay, DateType.DATE);
+                }
+                catch (DateTimeParseException ignored) {
+                }
             }
+        }
+        return expr;
+    }
 
-            int yearPart;
-            int monthPart;
-            try {
-                yearPart = Integer.parseInt(parts[0]);
-                monthPart = Integer.parseInt(parts[1]);
-            }
-            catch (NumberFormatException e) {
-                return expression;
-            }
-            if (monthPart < 1 || monthPart > 12) {
-                return expression;
-            }
+    private Optional<RowExpression> rewriteDateRange(RowExpression tsExpr, ConstantExpression dateLiteral)
+    {
+        long epochDay = ((Number) dateLiteral.getValue()).longValue();
 
-            // Lower bound: first day of the given year-month
-            String lowerTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart);
+        ConstantExpression lowerDate = new ConstantExpression(dateLiteral.getSourceLocation(), epochDay,     DateType.DATE);
+        ConstantExpression upperDate = new ConstantExpression(dateLiteral.getSourceLocation(), epochDay + 1, DateType.DATE);
 
-            // Upper bound: first day of the next month
-            String upperTimestamp;
-            if (monthPart == 12) {
-                // December → next year, January
-                upperTimestamp = String.format("%d-01-01 00:00:00.000", yearPart + 1);
-            }
-            else {
-                // Same year → next month
-                upperTimestamp = String.format("%d-%02d-01 00:00:00.000", yearPart, monthPart + 1);
-            }
+        CallExpression lowerTs = buildDateToTimestampCast(lowerDate);
+        CallExpression upperTs = buildDateToTimestampCast(upperDate);
 
-            RowExpression lowerBound = comparisonExpression(
-                    functionResolution,
-                    GREATER_THAN_OR_EQUAL,
-                    maybeMonthCol.get(),
-                    constant(lowerTimestamp, TIMESTAMP)
-            );
+        RowExpression ge = comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, tsExpr, lowerTs);
+        RowExpression lt = comparisonExpression(functionResolution, LESS_THAN,            tsExpr, upperTs);
 
-            RowExpression upperBound = comparisonExpression(
-                    functionResolution,
-                    LESS_THAN,
-                    maybeMonthCol.get(),
-                    constant(upperTimestamp, TIMESTAMP)
-            );
+        return Optional.of(createAndExpression(ge, lt));
+    }
 
-            return createAndExpression(lowerBound, upperBound);
+    private CallExpression buildDateToTimestampCast(ConstantExpression dateConstant)
+    {
+        FunctionHandle cast = functionAndTypeManager.lookupCast(
+                CastType.CAST,
+                dateConstant.getType(),
+                TimestampType.TIMESTAMP);
+
+        return new CallExpression(
+                dateConstant.getSourceLocation(),
+                OperatorType.CAST.name(),
+                cast,
+                TimestampType.TIMESTAMP,
+                ImmutableList.<RowExpression>of(dateConstant));
+    }
+
+    /* ====================================================================== */
+    /* ===            year() / month() / hour() / date_trunc()             === */
+    /* ====================================================================== */
+
+    private RowExpression rewriteExtendedEquality(RowExpression left, RowExpression right)
+    {
+        /* ---------- year() ---------- */
+        Optional<RowExpression> yearCol = extractFunctionArgument("year", left, right);
+        Optional<ConstantExpression> yearLit = extractNumericLiteral(left, right);
+        if (yearCol.isPresent() && yearLit.isPresent()) {
+            long y = ((Number) yearLit.get().getValue()).longValue();
+            String lower = String.format("%d-01-01 00:00:00.000", y);
+            String upper = String.format("%d-01-01 00:00:00.000", y + 1);
+            return createAndExpression(
+                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, yearCol.get(), constant(lower, TimestampType.TIMESTAMP)),
+                    comparisonExpression(functionResolution, LESS_THAN,            yearCol.get(), constant(upper, TimestampType.TIMESTAMP)));
         }
 
-        // ===========================
-        // 4) hour() logic
-        // ===========================
-        Optional<RowExpression> maybeHourCol = extractHourFunctionArgument(left, right);
-        Optional<ConstantExpression> maybeHourLiteral = extractHourLiteral(left, right);
-
-        if (maybeHourCol.isPresent() && maybeHourLiteral.isPresent()) {
-            // We assume the literal is "YYYY-MM-DD-HH"
-            String hourValue = maybeHourLiteral.get().getValue().toString();
-            String[] parts = hourValue.split("-");
-            if (parts.length != 4) {
-                return expression; // Not matching "YYYY-MM-DD-HH"
+        /* ---------- month() ---------- */
+        Optional<RowExpression> monthCol = extractFunctionArgument("month", left, right);
+        Optional<ConstantExpression> monthLit = extractStringLiteral(left, right);
+        if (monthCol.isPresent() && monthLit.isPresent()) {
+            String[] p = monthLit.get().getValue().toString().split("-");
+            if (p.length == 2) {
+                int yy = Integer.parseInt(p[0]);
+                int mm = Integer.parseInt(p[1]);
+                String lower = String.format("%d-%02d-01 00:00:00.000", yy, mm);
+                String upper = (mm == 12)
+                        ? String.format("%d-01-01 00:00:00.000", yy + 1)
+                        : String.format("%d-%02d-01 00:00:00.000", yy, mm + 1);
+                return createAndExpression(
+                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, monthCol.get(), constant(lower, TimestampType.TIMESTAMP)),
+                        comparisonExpression(functionResolution, LESS_THAN,            monthCol.get(), constant(upper, TimestampType.TIMESTAMP)));
             }
-
-            int yearPart, monthPart, dayPart, hourPart;
-            try {
-                yearPart = Integer.parseInt(parts[0]);
-                monthPart = Integer.parseInt(parts[1]);
-                dayPart = Integer.parseInt(parts[2]);
-                hourPart = Integer.parseInt(parts[3]);
-            }
-            catch (NumberFormatException e) {
-                return expression;
-            }
-
-            // Basic validation (not accounting for real calendar boundaries)
-            if (monthPart < 1 || monthPart > 12 ||
-                    dayPart < 1   || dayPart > 31  ||
-                    hourPart < 0  || hourPart > 23) {
-                return expression;
-            }
-
-            // Lower bound: the specified hour
-            String lowerTimestamp = String.format(
-                    "%04d-%02d-%02d %02d:00:00.000",
-                    yearPart, monthPart, dayPart, hourPart
-            );
-
-            // Upper bound: next hour (rollover if hour == 23 => day+1)
-            int nextHour = hourPart + 1;
-            int nextDay  = dayPart;
-            if (nextHour == 24) {
-                nextHour = 0;
-                nextDay  = dayPart + 1;
-                // Not handling month/year boundaries here
-            }
-
-            String upperTimestamp = String.format(
-                    "%04d-%02d-%02d %02d:00:00.000",
-                    yearPart, monthPart, nextDay, nextHour
-            );
-
-            RowExpression lowerBound = comparisonExpression(
-                    functionResolution,
-                    GREATER_THAN_OR_EQUAL,
-                    maybeHourCol.get(),
-                    constant(lowerTimestamp, TIMESTAMP)
-            );
-
-            RowExpression upperBound = comparisonExpression(
-                    functionResolution,
-                    LESS_THAN,
-                    maybeHourCol.get(),
-                    constant(upperTimestamp, TIMESTAMP)
-            );
-
-            return createAndExpression(lowerBound, upperBound);
         }
 
-        // ===========================
-        //  date_trunc() logic
-        // ===========================
-        Optional<CallExpression> maybeDtCall = extractDateTruncCall(left, right);
-        Optional<ConstantExpression> maybeDtLiteral = extractDateTruncLiteral(left, right);
+        /* ---------- hour() ---------- */
+        Optional<RowExpression> hourCol = extractFunctionArgument("hour", left, right);
+        Optional<ConstantExpression> hourLit = extractStringLiteral(left, right);
+        if (hourCol.isPresent() && hourLit.isPresent()) {
+            String[] p = hourLit.get().getValue().toString().split("-");
+            if (p.length == 4) {
+                int yy = Integer.parseInt(p[0]);
+                int mm = Integer.parseInt(p[1]);
+                int dd = Integer.parseInt(p[2]);
+                int hh = Integer.parseInt(p[3]);
 
-        if (maybeDtCall.isPresent() && maybeDtLiteral.isPresent()) {
-            CallExpression dtCall = maybeDtCall.get();
-            String unit = ((ConstantExpression) dtCall.getArguments().get(0)).getValue().toString().toLowerCase();
-            RowExpression colExpr = dtCall.getArguments().get(1);
+                String lower = String.format("%04d-%02d-%02d %02d:00:00.000", yy, mm, dd, hh);
 
-            String tsValue = maybeDtLiteral.get().getValue().toString();
-            // parse literal like "2024-03-12 00:00:00.000"
-            java.time.format.DateTimeFormatter fmt =
-                    java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.SSS");
-            java.time.LocalDateTime base = java.time.LocalDateTime.parse(tsValue, fmt);
+                int nextHour = (hh + 1) % 24;
+                int nextDay  = dd + (hh == 23 ? 1 : 0);   // naive day rollover; month/year edge ignored
 
-            // compute next boundary
-            java.time.LocalDateTime next;
+                String upper = String.format("%04d-%02d-%02d %02d:00:00.000", yy, mm, nextDay, nextHour);
+
+                return createAndExpression(
+                        comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, hourCol.get(), constant(lower, TimestampType.TIMESTAMP)),
+                        comparisonExpression(functionResolution, LESS_THAN,            hourCol.get(), constant(upper, TimestampType.TIMESTAMP)));
+            }
+        }
+
+        /* ---------- date_trunc() ---------- */
+        Optional<CallExpression> dtCallOpt = extractDateTruncCall(left);
+        if (!dtCallOpt.isPresent()) {
+            dtCallOpt = extractDateTruncCall(right);
+        }
+        Optional<ConstantExpression> tsLit = extractTimestampLiteral(left, right);
+        if (dtCallOpt.isPresent() && tsLit.isPresent()) {
+            CallExpression dtCall = dtCallOpt.get();
+            ConstantExpression unitExpr = (ConstantExpression) dtCall.getArguments().get(0);
+            String unit = unitExpr.getValue().toString().toLowerCase();
+            RowExpression tsColumn = dtCall.getArguments().get(1);
+
+            String baseStr = tsLit.get().getValue().toString();
+            LocalDateTime base = LocalDateTime.parse(baseStr, TS_FMT);
+            LocalDateTime next;
             switch (unit) {
                 case "day":
                     next = base.plusDays(1);
@@ -310,263 +272,109 @@ public class ConvertDateTimestampToTimestampBounds
                     next = base.plusYears(1);
                     break;
                 default:
-                    return expression; // unsupported unit
+                    return null;   // unsupported
             }
-            String nextTs = next.format(fmt);
 
-            RowExpression lower = comparisonExpression(
-                    functionResolution,
-                    GREATER_THAN_OR_EQUAL,
-                    colExpr,
-                    constant(tsValue, TIMESTAMP));
-
-            RowExpression upper = comparisonExpression(
-                    functionResolution,
-                    LESS_THAN,
-                    colExpr,
-                    constant(nextTs, TIMESTAMP));
-
-            return createAndExpression(lower, upper);
+            return createAndExpression(
+                    comparisonExpression(functionResolution, GREATER_THAN_OR_EQUAL, tsColumn, constant(baseStr,             TimestampType.TIMESTAMP)),
+                    comparisonExpression(functionResolution, LESS_THAN,            tsColumn, constant(next.format(TS_FMT), TimestampType.TIMESTAMP)));
         }
 
-        // If none of the patterns matched, return the expression unchanged.
-        return expression;
+        /* nothing matched */
+        return null;
     }
 
+    /* ====================================================================== */
+    /* ===                       Helper utilities                          === */
+    /* ====================================================================== */
 
     private RowExpression createAndExpression(RowExpression left, RowExpression right)
     {
-        FunctionHandle andHandle = functionResolution.lookupBuiltInFunction(
-                "and",
-                ImmutableList.of(BOOLEAN, BOOLEAN));
-
-        // Create an 'and' call combining the two expressions
-        return new CallExpression(
-                "and",
-                andHandle,
-                (Type) ImmutableList.of(left, right),
-                (List<RowExpression>) BOOLEAN
-        );
+        return new SpecialFormExpression(
+                left.getSourceLocation(),
+                AND,
+                BOOLEAN,
+                ImmutableList.<RowExpression>of(left, right));
     }
 
-    // ===========================
-    // date() extraction helpers
-    // ===========================
-    private Optional<RowExpression> extractDateFunctionArgument(RowExpression first, RowExpression second)
+    private RowExpression unwrapCasts(RowExpression expr)
     {
-        Optional<RowExpression> firstCheck = extractDateFunction(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
+        while (expr instanceof CallExpression) {
+            CallExpression call = (CallExpression) expr;
+            if (functionResolution.isCastFunction(call.getFunctionHandle())
+                    && call.getArguments().size() == 1) {
+                RowExpression inner = call.getArguments().get(0);
+                if (call.getType().equals(inner.getType())) {
+                    expr = inner;
+                    continue;
+                }
+            }
+            break;
         }
-        return extractDateFunction(second);
+        return expr;
     }
 
-    private Optional<ConstantExpression> extractDateLiteral(RowExpression first, RowExpression second)
+    private Optional<RowExpression> extractFunctionArgument(String name, RowExpression a, RowExpression b)
     {
-        Optional<ConstantExpression> firstCheck = extractConstantDateLiteral(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
+        if (a instanceof CallExpression) {
+            CallExpression c = (CallExpression) a;
+            if (name.equalsIgnoreCase(c.getDisplayName()) && !c.getArguments().isEmpty()) {
+                return Optional.of(c.getArguments().get(0));
+            }
         }
-        return extractConstantDateLiteral(second);
-    }
-
-    private Optional<RowExpression> extractDateFunction(RowExpression expr)
-    {
-        if (!(expr instanceof CallExpression)) {
-            return Optional.empty();
-        }
-        CallExpression call = (CallExpression) expr;
-
-        boolean isDateFunction = call.getDisplayName().equalsIgnoreCase("date") &&
-                call.getType().toString().equalsIgnoreCase("date");
-
-        if (!isDateFunction || call.getArguments().isEmpty()) {
-            return Optional.empty();
-        }
-        // Return the underlying timestamp argument inside date(t)
-        return Optional.of(call.getArguments().get(0));
-    }
-
-    private Optional<ConstantExpression> extractConstantDateLiteral(RowExpression expr)
-    {
-        if (!(expr instanceof ConstantExpression)) {
-            return Optional.empty();
-        }
-        return Optional.of((ConstantExpression) expr);
-    }
-
-    // ===========================
-    // year() extraction helpers
-    // ===========================
-    private Optional<RowExpression> extractYearFunctionArgument(RowExpression first, RowExpression second)
-    {
-        Optional<RowExpression> firstCheck = extractYearFunction(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
-        }
-        return extractYearFunction(second);
-    }
-
-    private Optional<ConstantExpression> extractYearLiteral(RowExpression first, RowExpression second)
-    {
-        Optional<ConstantExpression> firstCheck = extractConstantYearLiteral(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
-        }
-        return extractConstantYearLiteral(second);
-    }
-
-    private Optional<RowExpression> extractYearFunction(RowExpression expr)
-    {
-        if (!(expr instanceof CallExpression)) {
-            return Optional.empty();
-        }
-        CallExpression call = (CallExpression) expr;
-        if (!call.getDisplayName().equalsIgnoreCase("year") || call.getArguments().isEmpty()) {
-            return Optional.empty();
-        }
-        // Return the underlying timestamp argument inside year(t)
-        return Optional.of(call.getArguments().get(0));
-    }
-
-    private Optional<ConstantExpression> extractConstantYearLiteral(RowExpression expr)
-    {
-        if (!(expr instanceof ConstantExpression)) {
-            return Optional.empty();
-        }
-        ConstantExpression c = (ConstantExpression) expr;
-        Object value = c.getValue();
-        if (value instanceof Number) {
-            return Optional.of(c);
+        if (b instanceof CallExpression) {
+            CallExpression c = (CallExpression) b;
+            if (name.equalsIgnoreCase(c.getDisplayName()) && !c.getArguments().isEmpty()) {
+                return Optional.of(c.getArguments().get(0));
+            }
         }
         return Optional.empty();
     }
 
-    // ===========================
-    // month() extraction helpers
-    // ===========================
-    private Optional<RowExpression> extractMonthFunctionArgument(RowExpression first, RowExpression second)
+    private Optional<ConstantExpression> extractNumericLiteral(RowExpression a, RowExpression b)
     {
-        Optional<RowExpression> firstCheck = extractMonthFunction(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
+        if (a instanceof ConstantExpression && ((ConstantExpression) a).getValue() instanceof Number) {
+            return Optional.of((ConstantExpression) a);
         }
-        return extractMonthFunction(second);
+        if (b instanceof ConstantExpression && ((ConstantExpression) b).getValue() instanceof Number) {
+            return Optional.of((ConstantExpression) b);
+        }
+        return Optional.empty();
     }
 
-    private Optional<ConstantExpression> extractMonthLiteral(RowExpression first, RowExpression second)
+    private Optional<ConstantExpression> extractStringLiteral(RowExpression a, RowExpression b)
     {
-        Optional<ConstantExpression> firstCheck = extractConstantMonthLiteral(first);
-        if (firstCheck.isPresent()) {
-            return firstCheck;
+        if (a instanceof ConstantExpression && ((ConstantExpression) a).getValue() instanceof String) {
+            return Optional.of((ConstantExpression) a);
         }
-        return extractConstantMonthLiteral(second);
+        if (b instanceof ConstantExpression && ((ConstantExpression) b).getValue() instanceof String) {
+            return Optional.of((ConstantExpression) b);
+        }
+        return Optional.empty();
     }
 
-    private Optional<RowExpression> extractMonthFunction(RowExpression expr)
+    private Optional<ConstantExpression> extractTimestampLiteral(RowExpression a, RowExpression b)
     {
-        if (!(expr instanceof CallExpression)) {
-            return Optional.empty();
+        if (a instanceof ConstantExpression && ((ConstantExpression) a).getType() instanceof TimestampType) {
+            return Optional.of((ConstantExpression) a);
         }
-        CallExpression call = (CallExpression) expr;
-        if (!call.getDisplayName().equalsIgnoreCase("month") || call.getArguments().isEmpty()) {
-            return Optional.empty();
+        if (b instanceof ConstantExpression && ((ConstantExpression) b).getType() instanceof TimestampType) {
+            return Optional.of((ConstantExpression) b);
         }
-        // Return the underlying timestamp argument inside month(t)
-        return Optional.of(call.getArguments().get(0));
+        return Optional.empty();
     }
 
-    private Optional<ConstantExpression> extractConstantMonthLiteral(RowExpression expr)
+    private Optional<CallExpression> extractDateTruncCall(RowExpression expr)
     {
-        if (!(expr instanceof ConstantExpression)) {
-            return Optional.empty();
+        if (expr instanceof CallExpression) {
+            CallExpression call = (CallExpression) expr;
+            if ("date_trunc".equalsIgnoreCase(call.getDisplayName())
+                    && call.getArguments().size() == 2
+                    && call.getArguments().get(0) instanceof ConstantExpression) {
+                return Optional.of(call);
+            }
         }
-        return Optional.of((ConstantExpression) expr);
-    }
-
-    // ===========================
-    // hour() extraction helpers
-    // ===========================
-    private Optional<RowExpression> extractHourFunctionArgument(RowExpression first, RowExpression second)
-    {
-        Optional<RowExpression> leftCheck = extractHourFunction(first);
-        if (leftCheck.isPresent()) {
-            return leftCheck;
-        }
-        return extractHourFunction(second);
-    }
-
-    private Optional<ConstantExpression> extractHourLiteral(RowExpression first, RowExpression second)
-    {
-        Optional<ConstantExpression> leftCheck = extractConstantHourLiteral(first);
-        if (leftCheck.isPresent()) {
-            return leftCheck;
-        }
-        return extractConstantHourLiteral(second);
-    }
-
-    private Optional<RowExpression> extractHourFunction(RowExpression expr)
-    {
-        if (!(expr instanceof CallExpression)) {
-            return Optional.empty();
-        }
-        CallExpression call = (CallExpression) expr;
-        // Must be hour(...) with at least 1 arg
-        if (!call.getDisplayName().equalsIgnoreCase("hour") || call.getArguments().isEmpty()) {
-            return Optional.empty();
-        }
-        // hour(t) → return "t"
-        return Optional.of(call.getArguments().get(0));
-    }
-
-    private Optional<ConstantExpression> extractConstantHourLiteral(RowExpression expr)
-    {
-        if (!(expr instanceof ConstantExpression)) {
-            return Optional.empty();
-        }
-        return Optional.of((ConstantExpression) expr);
-    }
-
-    // --- date_trunc(...) extraction helpers ---
-
-    private Optional<CallExpression> extractDateTruncCall(RowExpression first, RowExpression second) {
-        Optional<CallExpression> firstOpt = extractDateTrunc(first);
-        if (firstOpt.isPresent()) {
-            return firstOpt;
-        }
-        return extractDateTrunc(second);
-    }
-
-    private Optional<CallExpression> extractDateTrunc(RowExpression expr) {
-        if (!(expr instanceof CallExpression)) {
-            return Optional.empty();
-        }
-        CallExpression call = (CallExpression) expr;
-        if (!call.getDisplayName().equalsIgnoreCase("date_trunc") ||
-                call.getArguments().size() != 2 ||
-                !(call.getArguments().get(0) instanceof ConstantExpression)) {
-            return Optional.empty();
-        }
-        return Optional.of(call);
-    }
-
-    private Optional<ConstantExpression> extractDateTruncLiteral(RowExpression first, RowExpression second) {
-        Optional<ConstantExpression> firstOpt = extractConstantTimestampLiteral(first);
-        if (firstOpt.isPresent()) {
-            return firstOpt;
-        }
-        return extractConstantTimestampLiteral(second);
-    }
-
-    private Optional<ConstantExpression> extractConstantTimestampLiteral(RowExpression expr) {
-        if (!(expr instanceof ConstantExpression)) {
-            return Optional.empty();
-        }
-        ConstantExpression c = (ConstantExpression) expr;
-        if (!c.getType().equals(TIMESTAMP)) {
-            return Optional.empty();
-        }
-        return Optional.of(c);
+        return Optional.empty();
     }
 }
 
